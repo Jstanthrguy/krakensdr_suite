@@ -4,6 +4,10 @@
 // ============================================
 
 #include "decimator_manager.hpp"
+#include "networking/managed_receiver.hpp"
+#ifdef TT01_D2_MANAGER_QUALIFICATION
+#include "networking/managed_audio_selection.hpp"
+#endif
 #include "control_handler.hpp"
 #include "config.hpp"
 #include "channel_manager.hpp"
@@ -32,6 +36,10 @@ DecimatorManager::~DecimatorManager() {
 void DecimatorManager::initialize(int num_channels, int initial_decimators) {
     std::lock_guard<std::mutex> lock(decimator_mutex);
 
+    for (auto& instance : decimators) {
+        managed_iq::registry().erase(instance->serial, instance);
+        instance->being_deleted = true;
+    }
     decimators.clear();
     next_id = 0;
 
@@ -48,7 +56,11 @@ void DecimatorManager::initialize(int num_channels, int initial_decimators) {
     }
 
     // The first VFO is heard by default
+#ifdef TT01_D2_MANAGER_QUALIFICATION
+    if (!decimators.empty()){auto& i=decimators.front();managed_iq::audio_selection::set(i->id,i->serial,i->audio_out,true);}
+#else
     if (!decimators.empty()) decimators.front()->audio_out = true;
+#endif
 
     std::cout << "DecimatorManager initialized with " << initial_decimators
               << " decimator(s) for " << num_channels << " channels" << std::endl;
@@ -58,6 +70,8 @@ void DecimatorManager::cleanup() {
     std::lock_guard<std::mutex> lock(decimator_mutex);
 
     for (auto& instance : decimators) {
+        managed_iq::registry().erase(instance->serial, instance);
+        instance->being_deleted = true;
         instance->decimator->cleanup();
         // MUSICProcessor cleanup is automatic in destructor
     }
@@ -65,7 +79,9 @@ void DecimatorManager::cleanup() {
     decimators.clear();
 }
 
-int DecimatorManager::addDecimator() {
+int DecimatorManager::addDecimator() { return addDecimator(false); }
+
+int DecimatorManager::addDecimator(bool managed_producer) {
     // Read BEFORE decimator_mutex: ChannelManager::update_channel_info holds
     // channel_info_mutex while it walks the decimators (decimator_mutex), so
     // taking them in the other order here could deadlock the uWS loop and the
@@ -103,6 +119,10 @@ int DecimatorManager::addDecimator() {
     }
 
     auto instance = std::make_shared<DecimatorInstance>(new_id);
+    if (managed_producer) {
+        if (!managed_iq::registry().claim(instance->serial, instance)) return -1;
+        instance->enabled = false;
+    }
 
     // Initialize with current number of channels (assume same as first decimator)
     if (!decimators.empty()) {
@@ -191,6 +211,7 @@ bool DecimatorManager::removeDecimator(int id) {
         }
 
         // Mark as being deleted so other threads skip it for new work
+        managed_iq::registry().erase((*it)->serial, *it);
         (*it)->being_deleted = true;
 
         // The last VFO heard goes: the first one left is heard instead (as
@@ -203,7 +224,11 @@ bool DecimatorManager::removeDecimator(int id) {
             if (!other) {
                 for (const auto& dec : decimators) {
                     if (dec->id != id) {
+#ifdef TT01_D2_MANAGER_QUALIFICATION
+managed_iq::audio_selection::set(dec->id,dec->serial,dec->audio_out,true);
+#else
                         dec->audio_out = true;
+#endif
                         std::cout << "Audio now from decimator " << dec->id << std::endl;
                         break;
                     }
@@ -256,8 +281,12 @@ size_t DecimatorManager::getDecimatorCount() const {
 }
 
 bool DecimatorManager::setFrequencyOffset(int id, float offset_hz) {
-    auto decimator = getDecimator(id);
+    return managed_iq::set_instance_offset(getDecimator(id),offset_hz);
+}
+
+bool managed_iq::set_instance_offset(const std::shared_ptr<Instance>& decimator,float offset_hz) {
     if (decimator) {
+        const int id=decimator->id;
         // Log offset changes
         if (fabs(decimator->frequency_offset_hz - offset_hz) > 0.1f) {
             std::cout << "Decimator " << id << " offset changed: "
@@ -265,6 +294,8 @@ bool DecimatorManager::setFrequencyOffset(int id, float offset_hz) {
                       << (offset_hz / 1000.0f) << " kHz" << std::endl;
         }
 
+        auto writer = managed_iq::registry().write(decimator->serial, decimator);
+        if (!writer || decimator->being_deleted.load()) return false;
         // Store the offset as-is for display/reference
         decimator->frequency_offset_hz = offset_hz;
 
@@ -275,7 +306,7 @@ bool DecimatorManager::setFrequencyOffset(int id, float offset_hz) {
         float rf_frequency = ChannelManager::get_frequency(active_channel.load(std::memory_order_relaxed));
         decimator->music_processor->setFrequency(rf_frequency + offset_hz);
 
-        return true;
+        return !decimator->being_deleted.load();
     }
     return false;
 }
@@ -283,6 +314,11 @@ bool DecimatorManager::setFrequencyOffset(int id, float offset_hz) {
 bool DecimatorManager::setBandwidthHz(int id, int hz, int* applied) {
     auto decimator = getDecimator(id);
     if (!decimator) return false;
+    auto writer = managed_iq::registry().write(decimator->serial, decimator);
+    if (!writer || decimator->being_deleted.load()) return false;
+#ifdef TT01_WRITER_TEST
+    if (managed_iq::writer_test_hook) managed_iq::writer_test_hook(id);
+#endif
     const int bw = clamp_bandwidth_hz(hz);
     decimator->bandwidth_hz = bw;
     decimator->decimator->setBandwidthHz(bw);
@@ -302,6 +338,8 @@ bool DecimatorManager::setBandwidthIndex(int id, int index) {
 bool DecimatorManager::setEnabled(int id, bool enabled) {
     auto decimator = getDecimator(id);
     if (decimator) {
+        auto writer = managed_iq::registry().write(decimator->serial, decimator);
+        if (!writer || decimator->being_deleted.load()) return false;
         decimator->enabled = enabled;
         if (enabled) {
             decimator->music_processor->enable();
@@ -316,6 +354,8 @@ bool DecimatorManager::setEnabled(int id, bool enabled) {
 bool DecimatorManager::setDemodMode(int id, DemodulatorMode mode) {
     auto decimator = getDecimator(id);
     if (decimator) {
+        auto writer = managed_iq::registry().write(decimator->serial, decimator);
+        if (!writer || decimator->being_deleted.load()) return false;
         decimator->demod_mode = mode;
         std::cout << "Decimator " << id << " demod mode set to " << demodModeToString(mode) << std::endl;
         return true;
@@ -337,6 +377,8 @@ void DecimatorManager::recountDigital() {
 bool DecimatorManager::setTranscribe(int id, bool on) {
     auto inst = getDecimator(id);
     if (!inst) return false;
+    auto writer = managed_iq::registry().write(inst->serial, inst);
+    if (!writer || inst->being_deleted.load()) return false;
     {
         std::lock_guard<std::mutex> lk(inst->digital_mu);
         inst->transcribe.store(on, std::memory_order_relaxed);
@@ -350,10 +392,17 @@ bool DecimatorManager::setTranscribe(int id, bool on) {
 bool DecimatorManager::setDigitalMode(int id, dig::Mode mode, const std::string& plugin) {
     auto inst = getDecimator(id);
     if (!inst) return false;
+    auto writer = managed_iq::registry().write(inst->serial, inst);
+    if (!writer || inst->being_deleted.load()) return false;
     {
         std::lock_guard<std::mutex> lk(inst->digital_mu);
         if (mode != dig::Mode::OFF) ensureDigital(*inst);
-        if (inst->digital) inst->digital->set_mode(mode, plugin);
+        if (inst->digital) {
+#ifdef TT01_ROLE_QUALIFICATION
+            inst->digital->bind_role(managed_iq::registry().state(inst->serial,inst));
+#endif
+            inst->digital->set_mode(mode, plugin);
+        }
         inst->digital_mode.store(static_cast<int>(mode), std::memory_order_relaxed);
         // DoA per talker while a decoder can report talkers
         inst->talker_doa->set_active(mode != dig::Mode::OFF);
@@ -366,8 +415,13 @@ bool DecimatorManager::setDigitalMode(int id, dig::Mode mode, const std::string&
 bool DecimatorManager::setDigitalOptions(int id, const dig::Options& opts) {
     auto inst = getDecimator(id);
     if (!inst) return false;
+    auto writer = managed_iq::registry().write(inst->serial, inst);
+    if (!writer || inst->being_deleted.load()) return false;
     std::lock_guard<std::mutex> lk(inst->digital_mu);
     ensureDigital(*inst);
+#ifdef TT01_ROLE_QUALIFICATION
+    inst->digital->bind_role(managed_iq::registry().state(inst->serial,inst));
+#endif
     inst->digital->set_options(opts);
     return true;
 }
@@ -410,6 +464,8 @@ void DecimatorManager::ensureDigital(DecimatorInstance& inst) {
 bool DecimatorManager::setSquelchEnabled(int id, bool enabled) {
     auto decimator = getDecimator(id);
     if (decimator) {
+        auto writer = managed_iq::registry().write(decimator->serial, decimator);
+        if (!writer || decimator->being_deleted.load()) return false;
         decimator->squelch_enabled.store(enabled, std::memory_order_relaxed);
         std::cout << "Decimator " << id << " squelch " << (enabled ? "enabled" : "disabled") << std::endl;
         return true;
@@ -420,6 +476,8 @@ bool DecimatorManager::setSquelchEnabled(int id, bool enabled) {
 bool DecimatorManager::setSquelchLevel(int id, float level_db) {
     auto decimator = getDecimator(id);
     if (decimator) {
+        auto writer = managed_iq::registry().write(decimator->serial, decimator);
+        if (!writer || decimator->being_deleted.load()) return false;
         decimator->squelch_level.store(level_db, std::memory_order_relaxed);
         std::cout << "Decimator " << id << " squelch level set to " << level_db << " dB" << std::endl;
         return true;
@@ -430,6 +488,8 @@ bool DecimatorManager::setSquelchLevel(int id, float level_db) {
 bool DecimatorManager::setSquelchMethod(int id, int method) {
     auto decimator = getDecimator(id);
     if (decimator) {
+        auto writer = managed_iq::registry().write(decimator->serial, decimator);
+        if (!writer || decimator->being_deleted.load()) return false;
         method = method == static_cast<int>(SquelchMethod::DIGITAL) ? method : static_cast<int>(SquelchMethod::FFT);
         decimator->squelch_method.store(method, std::memory_order_relaxed);
         std::cout << "Decimator " << id << " squelch method set to "
@@ -527,7 +587,11 @@ bool DecimatorManager::setAudioVfo(int id, bool on) {
     std::lock_guard<std::mutex> lock(decimator_mutex);
     for (const auto& inst : decimators) {
         if (inst->id == id) {
+#ifdef TT01_D2_MANAGER_QUALIFICATION
+managed_iq::audio_selection::set(inst->id,inst->serial,inst->audio_out,on);
+#else
             inst->audio_out = on;
+#endif
             return true;
         }
     }
@@ -537,7 +601,11 @@ bool DecimatorManager::setAudioVfo(int id, bool on) {
 void DecimatorManager::setAudioVfos(const std::vector<int>& ids) {
     std::lock_guard<std::mutex> lock(decimator_mutex);
     for (const auto& inst : decimators)
+#ifdef TT01_D2_MANAGER_QUALIFICATION
+managed_iq::audio_selection::set(inst->id,inst->serial,inst->audio_out,std::find(ids.begin(), ids.end(), inst->id) != ids.end());
+#else
         inst->audio_out = std::find(ids.begin(), ids.end(), inst->id) != ids.end();
+#endif
 }
 
 std::vector<int> DecimatorManager::audioVfoIds() const {

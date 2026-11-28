@@ -196,7 +196,7 @@ check_kraken() {
     stamp_ok "$K/plugins/lib/build/.flags" 1 || return 1
     stamp_older "$K/plugins/lib/build/.flags" "$K/plugins/lib/build/libkrakendig.a" || return 1
     ref="$(ref_file "$exe" "$OK_STAMP_K")"
-    f="$(newer_source "$ref" "$K/src" "$K/include" "$K/external" "$K/Makefile" "$K/liquid.mk" "$K/plugins" ${MAC_DIR_K:+"$MAC_DIR_K"})"
+    f="$(newer_source "$ref" "$K/src" "$K/include" "$K/external" "$K/Makefile" "$K/liquid.mk" "$K/operational-profile.mk" "$K/plugins" ${MAC_DIR_K:+"$MAC_DIR_K"})"
     [[ -n "$f" ]] && { need "$(rel "$f") is newer than the build"; return 1; }
     uws_ok "$K" || return 1
     return 0

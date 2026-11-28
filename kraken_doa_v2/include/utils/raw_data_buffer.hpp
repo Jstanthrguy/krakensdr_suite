@@ -18,6 +18,14 @@ struct RawDataPacket {
     uint32_t samples_per_channel;                       // Samples per channel
     uint32_t phase_compensation_state;                  // Phase calibration state from server
     uint32_t noise_source_active;                       // Bias tee / noise source status
+    // Host provenance: not a hardware capture timestamp or retune ACK.
+    uint64_t source_epoch = 0;                           // connection / source / framing discontinuity
+    uint64_t wire_continuity = 0;                        // observed header discontinuity generation
+    uint32_t wire_phase_flags = 0;                      // raw phase/mode flags before masking
+    uint32_t wire_frequency_counter = 0;
+    uint32_t wire_group_index = 0;
+    bool wire_retuning = false;
+    bool wire_playback = false;
     uint64_t seq = 0;                                   // packet number (every parsed packet, skipped ones too)
     float freq_hz[MAX_CHANNELS] = {};                   // each channel's frequency in this packet's header
     std::chrono::steady_clock::time_point timestamp;

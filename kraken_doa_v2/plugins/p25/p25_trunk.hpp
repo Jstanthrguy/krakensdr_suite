@@ -34,8 +34,26 @@ public:
     // a trunking block (TSBK) or a TDMA control channel's LCCH burst passed
     // its checks: this VFO is on a control channel
     void control_seen();
+#ifdef TT01_K_CONTROL_WIRE
+    void control_tsbk(uint16_t nac,const uint8_t* block){
+        const int op=block[0]&0x3f;
+        if((block[0]&0x40)||(block[1]!=0&&block[1]!=1))return;
+        switch(op){
+        case 0x3a:case 0x3b:case 0x33:case 0x34:case 0x3d:
+        case 0x00:case 0x02:case 0x03:case 0x04:case 0x06:case 0x08:case 0x09:
+            host_.p25_control_tsbk(nac,block);break;
+        default:break;
+        }
+    }
+#endif
     // WACN / system ID from the network status broadcast (Phase 1 TSBK,
     // Phase 2 MAC): the network's key
+#ifdef TT01_D1_PCM_WIRE
+    bool typed_pcm=false; // private managed-runner opt-in, manual default off
+    void pcm(uint32_t target,uint32_t src,uint16_t nac,uint8_t phase,uint8_t lch,bool group,const float* x,size_t n){
+        if(typed_pcm&&target)host_.p25_pcm(target,src,nac,phase,lch,group,x,n);
+    }
+#endif
     void network(int wacn, int sysid);
     // the identity a Phase 2 traffic channel works with (options, recovered
     // from its bursts): the key when no network status was heard

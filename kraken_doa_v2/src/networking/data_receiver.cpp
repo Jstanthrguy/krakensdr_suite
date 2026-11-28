@@ -17,6 +17,9 @@
 #include "signal_processing/fft_processor.hpp"
 #include "signal_processing/fm_demodulator.hpp"
 #include "signal_processing/audio_mixer.hpp"
+#ifdef TT01_D2_MIXER_QUALIFICATION
+#include "networking/managed_audio_mix.hpp"
+#endif
 #include "signal_processing/shared_decimator.hpp"
 #include "signal_processing/beamformer.hpp"
 #include "signal_processing/noise_floor.hpp"
@@ -29,6 +32,10 @@
 #include "utils/system_stats.hpp"
 #include "utils/ring_buffer.hpp"
 #include "utils/raw_data_buffer.hpp"
+#include "networking/managed_receiver.hpp"
+#ifdef TT01_RECEIVER_QUALIFICATION
+#include "networking/managed_receiver_test.hpp"
+#endif
 #include "utils/iq_converter.hpp"
 #include "channel_manager.hpp"
 #include "scanner_manager.hpp"
@@ -65,6 +72,9 @@ struct DecimatedFMWorkItem {
     int decimation_used;
     float output_rate_hz;
     chrono::steady_clock::time_point timestamp;
+#ifdef TT01_D2_MIXER_QUALIFICATION
+    std::optional<managed_iq::audio_mix::ManualKey> audio_key;
+#endif
     
     // OPTIMIZATION: Add move constructor and move assignment
     DecimatedFMWorkItem() = default;
@@ -195,8 +205,10 @@ void DataReceiver::data_receiver_thread() {
     // source switch): the Signal ID tap restarts its snapshot (sigclass_service.hpp)
     bool stream_gap = true;
 
-    // Upper bound for the per-channel sample count in a packet header
-    constexpr size_t MAX_SAMPLES_PER_CHANNEL = 65536;
+    iq_ingress::Session ingress;
+#ifdef TT01_RECEIVER_QUALIFICATION
+    managed_iq::IndependentDcHistory independent_dc;
+#endif
 
     // Track server-side scanner frequency changes
     uint32_t last_frequency_change_counter = 0;
@@ -266,9 +278,16 @@ void DataReceiver::data_receiver_thread() {
         // into one structurally-valid-but-garbage packet.
         bytes_in_buffer = 0;
         stream_gap = true;
+        ingress.open(pb);
 
         while (running) {
             if (playback::active() != pb) break;   // source switched
+            if (!ingress.current()) {
+                // A flush invalidated both queued and partially read bytes.
+                bytes_in_buffer = 0;
+                stream_gap = true;
+                ingress.after_discard();
+            }
             if (replay_pending && !pb && steady_now_ms() >= replay_deadline_ms) {
                 cerr << "No packet from heimdall " << REPLAY_WAIT_MS / 1000
                      << " s after connecting - restoring the saved settings anyway" << endl;
@@ -290,6 +309,15 @@ void DataReceiver::data_receiver_thread() {
                 buffer.size() - bytes_in_buffer
             );
             
+            if (playback::active()!=pb) break;
+            if (!ingress.current()) {
+                // A flush overlapped the read; do not stamp those bytes with
+                // the new epoch. Framing resync on the next read is explicit.
+                bytes_in_buffer=0;
+                stream_gap=true;
+                ingress.after_discard();
+                continue;
+            }
             if (pb && bytes_read <= 0) continue;
             if (bytes_read < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
                 // Receive timeout (SO_RCVTIMEO) - no data yet; loop so the
@@ -309,52 +337,28 @@ void DataReceiver::data_receiver_thread() {
             // Parse complete packets from TCP stream
             size_t offset = 0;
             while (offset + 32 <= bytes_in_buffer) {  // Minimum header now 32 bytes (added retuning_in_progress)
-                uint32_t magic = EndianUtils::read_be32(buffer.data(), offset);
-
-                if (magic != TCP_MAGIC) {
-                    offset++;
-                    stream_gap = true;
+                iq_ingress::Frame frame;
+                const auto framing=iq_ingress::inspect(buffer.data()+offset,bytes_in_buffer-offset,frame);
+                if (framing==iq_ingress::FrameStatus::incomplete) break;
+                if (framing==iq_ingress::FrameStatus::invalid) {
+                    if (!ingress.invalid_byte()) { offset=bytes_in_buffer; break; }
+                    ++offset;
+                    stream_gap=true;
                     continue;
                 }
-
-                uint32_t channels = EndianUtils::read_be32(buffer.data(), offset + 4);
-                uint32_t samples = EndianUtils::read_be32(buffer.data(), offset + 8);
-                uint32_t phase_comp_state = EndianUtils::read_be32(buffer.data(), offset + 12);
-                uint32_t noise_source = EndianUtils::read_be32(buffer.data(), offset + 16);
-
-                // KerberosSDR support flags piggyback on the phase-state
-                // field's high bits (heimdall tcp_data_server): bit 8 =
-                // kerberos mode, bit 9 = calibration stale. Mask them off so
-                // every downstream phase-state comparison keeps working.
-                server_kerberos_mode.store((phase_comp_state & 0x100u) != 0, std::memory_order_relaxed);
-                server_cal_stale.store((phase_comp_state & 0x200u) != 0, std::memory_order_relaxed);
-                // Bits 10 / 11 / 13: heimdall's operating mode (wideband scan /
-                // independent / sweep - sweep comes with 0x800, so a client
-                // that doesn't know it sees independent tuners), acted on after
-                // the sanity gate below
-                const int hmode = (phase_comp_state & 0x2000u) ? 3 : (phase_comp_state & 0x800u) ? 2
-                                : (phase_comp_state & 0x400u) ? 1 : 0;
-                // Bit 12: generic RTL-SDRs, no KrakenSDR (no coherent mode).
-                // Stored after the sanity gate below (a false magic match
-                // must not flip it); bits above it are ignored
-                const bool generic_bit = (phase_comp_state & 0x1000u) != 0;
-                phase_comp_state &= 0xFFu;
-                uint32_t frequency_change_counter = EndianUtils::read_be32(buffer.data(), offset + 20);
-                uint32_t current_group_index = EndianUtils::read_be32(buffer.data(), offset + 24);
-                uint32_t retuning_in_progress = EndianUtils::read_be32(buffer.data(), offset + 28);
-
-                // Sanity-check header fields BEFORE acting on them: a corrupt
-                // or desynced stream must not drive huge allocations
-                // (channels*samples*2 wraps in 32-bit arithmetic), out-of-
-                // bounds metadata reads, or a parser stall waiting for a
-                // bogus multi-GB "packet". Treat as a false magic match and
-                // resync byte by byte.
-                if (channels == 0 || channels > MAX_CHANNELS ||
-                    samples == 0 || samples > MAX_SAMPLES_PER_CHANNEL) {
-                    offset++;
-                    stream_gap = true;
-                    continue;
-                }
+                RawDataPacket raw_packet;
+                if (!ingress.stamp(frame,raw_packet)) { offset=bytes_in_buffer; break; }
+                const uint32_t channels=frame.channels, samples=frame.samples;
+                const uint32_t phase_comp_state=frame.phase_flags&0xffu;
+                const uint32_t noise_source=frame.noise;
+                const int hmode=frame.mode();
+                const bool generic_bit=(frame.phase_flags&0x1000u)!=0;
+                const uint32_t frequency_change_counter=frame.counter, current_group_index=frame.group;
+                const uint32_t retuning_in_progress=frame.retuning;
+                const size_t header_size=frame.header_size, packet_size=frame.packet_size;
+                // All state effects occur only after complete framing.
+                server_kerberos_mode.store((frame.phase_flags&0x100u)!=0,std::memory_order_relaxed);
+                server_cal_stale.store((frame.phase_flags&0x200u)!=0,std::memory_order_relaxed);
 
                 // Generic RTL-SDR mode changed (first packet of a generic
                 // heimdall, or a KrakenSDR heimdall after it; a debug playback
@@ -456,40 +460,11 @@ void DataReceiver::data_receiver_thread() {
 
                 was_retuning = is_retuning;
 
-                // Header: magic(4) + channels(4) + samples(4) + phase_state(4) + noise_source(4) +
-                //         freq_change_counter(4) + current_group_index(4) + retuning_in_progress(4) + per-channel(8*N)
-                size_t header_size = 32 + static_cast<size_t>(channels) * 8;
-                size_t packet_size = header_size + static_cast<size_t>(channels) * samples * 2;
-                
-                if (offset + packet_size > bytes_in_buffer) {
-                    break;
-                }
-                
-                // every whole packet is numbered (a jump after the decimation = lost packets)
-                static uint64_t packet_seq = 0;
-                packet_seq++;
-                RawDataPacket raw_packet;
-                raw_packet.seq = packet_seq;
-                raw_packet.num_channels = channels;
-                raw_packet.samples_per_channel = samples;
-                raw_packet.phase_compensation_state = phase_comp_state;
-                raw_packet.noise_source_active = noise_source;
                 raw_packet.channel_iq_data.resize(channels);
+                const auto& ch_freq_hz=frame.center;
+                for (uint32_t ch=0; ch<channels; ++ch)
+                    ChannelManager::update_channel_info(ch,frame.center[ch],frame.gain[ch]);
 
-                // Parse channel metadata (now starts at offset 32 after retuning_in_progress field)
-                std::array<float, MAX_CHANNELS> ch_freq_hz{};
-                for (uint32_t ch = 0; ch < channels && ch < MAX_CHANNELS; ch++) {
-                    size_t ch_info_offset = offset + 32 + ch * 8;
-
-                    float frequency_hz = EndianUtils::read_le_float(buffer.data(), ch_info_offset);
-                    float gain_db = EndianUtils::read_le_float(buffer.data(), ch_info_offset + 4);
-
-                    ch_freq_hz[ch] = frequency_hz;
-                    raw_packet.freq_hz[ch] = frequency_hz;   // where its spectrum is (FFTWorkItem::freq_hz)
-
-                    ChannelManager::update_channel_info(ch, frequency_hz, gain_db);
-                }
-                
                 // Arm the DoA retune hold whenever the REFERENCE channel's
                 // metadata frequency changes. This is ground truth in every
                 // packet - unlike retuning_in_progress (a pulse that can fall
@@ -564,6 +539,7 @@ void DataReceiver::data_receiver_thread() {
                     int elems = active_num_elements.load(std::memory_order_relaxed);
                     if (static_cast<int>(channels) != elems && channels >= 1 && channels <= MAX_CHANNELS) {
                         cout << "Active elements synced from server: " << elems << " → " << channels << endl;
+                        managed_iq::DomainWrite domain;
                         active_num_elements.store(channels, std::memory_order_release);
                         elems = static_cast<int>(channels);
                         // VFOs on a tuner that is gone move to tuner 0 (and the sweep's plan follows)
@@ -697,6 +673,13 @@ void DataReceiver::data_receiver_thread() {
                         if (channels_to_convert[ch]) {
                             const uint8_t* channel_iq_bytes = buffer.data() + offset + header_size + ch * samples * 2;
 
+#ifdef TT01_RECEIVER_QUALIFICATION
+                            if(hmode==2&&!pb){
+                                independent_dc.convert(raw_packet,ch,channel_iq_bytes,
+                                    raw_packet.channel_iq_data[ch].data());
+                                continue;
+                            }
+#endif
                             IQConverter::convert_uint8_to_complex_float_tracked_dc(
                                 channel_iq_bytes,
                                 raw_packet.channel_iq_data[ch].data(),
@@ -729,6 +712,7 @@ void DataReceiver::data_receiver_thread() {
 
             global_stats.print_stats_if_time(thread_idx);
         }
+        ingress.close();
     }
 
     cout << "Data receiver thread exiting" << endl;
@@ -746,6 +730,10 @@ void DataReceiver::decimation_processor_thread() {
     // only); vfo_auto = each VFO's set in the block being processed
     vector<AutoStreamSet> auto_sets;
     vector<AutoStreamSet*> vfo_auto;
+#ifdef TT01_RECEIVER_QUALIFICATION
+    // Offline-only branch: qualified managed results are withheld, not pushed.
+    managed_iq::ReceiverSelection selection;
+#endif
 
     while (running) {
         RawDataPacket raw_packet;
@@ -758,6 +746,10 @@ void DataReceiver::decimation_processor_thread() {
         }
 
         if (raw_packet.is_stale(milliseconds(1500))) {
+#ifdef TT01_RAW_LOSS_QUALIFICATION
+            auto expected=raw_packet.source_epoch;
+            iq_ingress::source_epoch().resync(expected);
+#endif
             global_stats.increment_errors(thread_idx);
             continue;
         }
@@ -823,14 +815,57 @@ void DataReceiver::decimation_processor_thread() {
         // Run decimators if DoA (MUSIC), FM, or beamforming needs processing
         // Digital voice/data decoders consume their VFO's decimated stream,
         // and so does Voice to Text (voice2text.cpp) on VFOs without a decoder
+#ifdef TT01_RECEIVER_QUALIFICATION
+        const bool observed_digital_hint = decimator_manager.anyDigitalActive();
+        const bool digital_hint = managed_iq::test::demand_hint ?
+            managed_iq::test::demand_hint(observed_digital_hint) : observed_digital_hint;
+#ifdef TT01_PRODUCER_COLD_QUALIFICATION
+        // A relaxed aggregate count is only a scheduling hint. In the
+        // qualified lane, sample one manager inventory after ingress stamping.
+        // Publication capture synchronizes completed writers before inspecting
+        // fixed decoder demand; later writers fence that old authority.
+        // New authority cannot consume prepublication input (seq/time cutoff).
+        const auto inventory = decimator_manager.getAllDecimators();
+        vector<bool> fixed_demand(inventory.size(),false);
+        bool fixed_any=false;
+        if((raw_packet.wire_phase_flags&0x2800u)==0x800u&&!raw_packet.wire_playback){
+            for(size_t v=0;v<inventory.size();++v){
+                const auto& inst=inventory[v];
+                if(!inst)continue;
+                auto pub=managed_iq::registry().state(inst->serial,inst);
+                auto role=pub?pub->capture_role():std::nullopt;
+                if(!role||!inst->enabled.load()||inst->being_deleted.load())continue;
+                bool wanted=false;
+                if(role->role==managed_iq::Role::managed){
+                    wanted=bool(pub->snapshot());
+                }else if(role->role==managed_iq::Role::manual){
+                    auto dd=inst->getDigital();
+                    const int t=inst->tuner_channel.load();
+                    wanted=dd&&t>=0&&t<MAX_CHANNELS&&
+                        dd->mode()==dig::Mode::PLUGIN&&dd->plugin_id()=="p25";
+                }
+                fixed_demand[v]=wanted&&pub->role_current(*role);
+                fixed_any|=fixed_demand[v];
+            }
+        }
+        const bool digital_needs_processing=digital_hint||fixed_any;
+#else
+        const bool digital_needs_processing=digital_hint;
+#endif
+#else
         const bool digital_needs_processing = decimator_manager.anyDigitalActive();
+#endif
         const bool transcribe_needs_processing = decimator_manager.anyTranscribeActive();
         // 📼 recorder: a VFO's band of every antenna (IQ), VFOs' audio
         const int rec_band_vfo = wideband_enabled ? -1 : rec::band_vfo();
         const bool rec_audio = rec::audio_active();
         if ((music_needs_processing || fm_needs_processing || beamforming_needs_processing || digital_needs_processing ||
              transcribe_needs_processing || rec_band_vfo >= 0 || rec_audio) &&
+#ifdef TT01_PRODUCER_COLD_QUALIFICATION
+            !inventory.empty()) {
+#else
             decimator_manager.getDecimatorCount() > 0) {
+#endif
             // OPTIMIZED PIPELINE: Process decimation + MUSIC in single async tasks
             // This eliminates the synchronization barrier between decimation and MUSIC stages
             // FM / digital only (no MUSIC, no beamforming): the FM audio, the
@@ -842,14 +877,33 @@ void DataReceiver::decimation_processor_thread() {
             // (a VFO-band recording needs every antenna: decimated as with DoA on)
             const bool fm_only = !music_needs_processing && !beamforming_needs_processing && rec_band_vfo < 0;
             vector<shared_ptr<DecimatorManager::DecimatorInstance>> active_decimators;
+#ifdef TT01_PRODUCER_COLD_QUALIFICATION
+            vector<bool> active_fixed;
+            const bool legacy_demand=music_needs_processing||fm_needs_processing||
+                beamforming_needs_processing||digital_hint||transcribe_needs_processing||
+                rec_band_vfo>=0||rec_audio;
+            for(size_t i=0;i<inventory.size();++i){
+                auto inst=inventory[i];
+                const bool fixed=fixed_demand[i];
+                if(!fixed&&!legacy_demand)continue;
+                // A writer after capture may retire the role or delete the
+                // instance. prepare rechecks exact live authority; no borrowed
+                // admission merely because a previous demand was observed.
+                if(!inst||(!fixed&&(!inst->enabled||inst->being_deleted.load(std::memory_order_relaxed))))continue;
+#else
             for (auto& inst : decimator_manager.getAllDecimators()) {
                 // Skip disabled or being-deleted decimators
                 if (!inst || !inst->enabled || inst->being_deleted.load(std::memory_order_relaxed)) continue;
+#endif
                 const bool single_wanted = (fm_needs_processing && inst->audio_out.load(std::memory_order_relaxed)) ||
                                            inst->digital_mode.load(std::memory_order_relaxed) != 0 ||
                                            inst->transcribe.load(std::memory_order_relaxed) ||
                                            (rec_audio && rec::audio_wants(inst->id));
+#ifdef TT01_PRODUCER_COLD_QUALIFICATION
+                if (fm_only && !single_wanted && !fixed) {
+#else
                 if (fm_only && !single_wanted) {
+#endif
                     // Not decimated in this mode, but keep its FFT-method
                     // squelch indicator live (it reads the main FFT only; a
                     // VFO without a decoder can't be on the Digital squelch)
@@ -863,6 +917,9 @@ void DataReceiver::decimation_processor_thread() {
                     }
                     continue;
                 }
+#ifdef TT01_PRODUCER_COLD_QUALIFICATION
+                active_fixed.push_back(fixed);
+#endif
                 active_decimators.push_back(std::move(inst));
             }
 
@@ -877,34 +934,25 @@ void DataReceiver::decimation_processor_thread() {
             const size_t num_vfos = active_decimators.size();
             vector<SharedDecimator::VfoBlock> vfo_blocks(num_vfos);
             vector<DecimatorManager::ProcessResult> results(num_vfos);
+#ifdef TT01_D2_MIXER_QUALIFICATION
+            std::vector<std::optional<managed_iq::audio_mix::ManualKey>> audio_keys(num_vfos);
+#endif
+#ifdef TT01_RECEIVER_QUALIFICATION
+            selection.prune();
+            vector<managed_iq::ReceiverSelection::Job> selection_jobs(num_vfos);
+#endif
             for (size_t v = 0; v < num_vfos; v++) {
-                const auto& inst = active_decimators[v];
-                DecimatorManager::ProcessResult& r = results[v];
-                r.decimator_id = inst->id;
-                r.audio_out = inst->audio_out.load(std::memory_order_relaxed);
-                r.instance = inst;  // kept for the post-barrier beamforming pass
-
-                SharedDecimator::VfoBlock& b = vfo_blocks[v];
-                b.decimator = inst->decimator.get();
-                b.bandwidth_hz = inst->decimator->getBandwidthHz();
-                b.freq_offset_hz = inst->frequency_offset_hz;
-                b.out = &r.decimated_data;
-                // a channel the packet lacks stays a null entry (an empty result)
-                auto take = [&raw_packet, &b](int ch) {
-                    if (b.num_channels >= static_cast<size_t>(MAX_CHANNELS)) return;
-                    if (ch >= 0 && ch < static_cast<int>(raw_packet.channel_iq_data.size())) {
-                        b.ptrs[b.num_channels] = raw_packet.channel_iq_data[ch].data();
-                        b.lens[b.num_channels] = raw_packet.channel_iq_data[ch].size();
-                    }
-                    b.num_channels++;
-                };
-                if (wideband_enabled) {
-                    take(inst->tuner_channel.load(std::memory_order_relaxed));
-                } else if (fm_only) {
-                    take(current_active);
-                } else {
-                    for (int ch = 0; ch < packet_elements; ch++) take(ch);
-                }
+                const auto& inst=active_decimators[v];
+#ifdef TT01_D2_MIXER_QUALIFICATION
+                audio_keys[v]=managed_iq::audio_mix::capture(inst);
+#endif
+#ifdef TT01_RECEIVER_QUALIFICATION
+                selection_jobs[v]=selection.prepare(inst,raw_packet,wideband_enabled,fm_only,
+                    current_active,packet_elements,vfo_blocks[v],results[v]);
+#else
+                managed_iq::legacy_block(inst,raw_packet,wideband_enabled,fm_only,
+                    current_active,packet_elements,vfo_blocks[v],results[v]);
+#endif
             }
 
             // Auto detect's internal streams (AutoStreamSet above): extra
@@ -918,6 +966,9 @@ void DataReceiver::decimation_processor_thread() {
             vfo_auto.assign(num_vfos, nullptr);
             for (size_t v = 0; v < num_vfos; v++) {
                 const auto& inst = active_decimators[v];
+#ifdef TT01_RECEIVER_QUALIFICATION
+                if (selection_jobs[v].kind!=managed_iq::ReceiverSelection::Kind::manual) continue;
+#endif
                 if (inst->digital_mode.load(std::memory_order_relaxed) != static_cast<int>(dig::Mode::AUTO)) continue;
                 const auto dd = inst->getDigital();
                 if (!dd || !dd->internal_streams() || !dd->wants_streams()) continue;
@@ -986,15 +1037,57 @@ void DataReceiver::decimation_processor_thread() {
             // filter each chunk of it while it is in the core's L1 - each
             // VFO's own decimateMultiChannel read every antenna's block
             // again). One VFO: exactly its decimateMultiChannel
+#ifdef TT01_RECEIVER_QUALIFICATION
+            if(managed_iq::test::before_pass)
+                managed_iq::test::before_pass(raw_packet,selection_jobs,vfo_blocks);
+            bool pass_ok=true;
+#endif
             try {
+#ifdef TT01_RECEIVER_QUALIFICATION
+                if(managed_iq::test::inside_pass)managed_iq::test::inside_pass();
+#endif
                 SharedDecimator::decimateVfos(vfo_blocks.data(), vfo_blocks.size());   // the VFOs + internal streams
             } catch (const std::exception& e) {
                 cerr << "Decimation error: " << e.what() << endl;
+#ifdef TT01_RECEIVER_QUALIFICATION
+                pass_ok=false;
+#endif
                 for (auto& r : results) r.decimated_data = SharedDecimator::MultiChannelDecimated();
                 for (auto& s : auto_sets)
                     for (auto& st : s.streams) st.out = SharedDecimator::MultiChannelDecimated();
             }
 
+#ifdef TT01_RECEIVER_QUALIFICATION
+            vector<managed_iq::ReceiverSelection::Outcome> outcomes;
+            vector<bool> auxiliary;
+#ifdef TT01_ROLE_QUALIFICATION
+            vector<std::shared_ptr<const managed_iq::ManualEnvelope>> manual_stamps(num_vfos);
+#endif
+            for(size_t v=0;v<num_vfos;++v){
+                auto outcome=selection.finish(selection_jobs[v],raw_packet,vfo_blocks[v],results[v],pass_ok);
+#ifdef TT01_WORKER_QUALIFICATION
+                if(outcome==managed_iq::ReceiverSelection::Outcome::managed_qualified)
+#ifdef TT01_PRODUCER_COLD_QUALIFICATION
+                    {if(!selection.submit(selection_jobs[v],results[v]))
+                        outcome=managed_iq::ReceiverSelection::Outcome::rejected;}
+#else
+                    selection.submit(selection_jobs[v],results[v]);
+#endif
+#endif
+#ifdef TT01_ROLE_QUALIFICATION
+                if(outcome==managed_iq::ReceiverSelection::Outcome::manual)
+                    manual_stamps[v]=selection.take_manual(selection_jobs[v],results[v]);
+#endif
+                managed_iq::ReceiverSelection::withhold(outcome,results[v]);
+                if(outcome!=managed_iq::ReceiverSelection::Outcome::manual)vfo_auto[v]=nullptr;
+                outcomes.push_back(outcome);
+                auxiliary.push_back(vfo_auto[v]!=nullptr);
+            }
+            // A bounded offline harness can stop here, before even the
+            // legacy/manual consumers. No live app or socket is required.
+            if(managed_iq::test::after_pass&&managed_iq::test::after_pass(
+                raw_packet,selection_jobs,outcomes,results,auxiliary))return;
+#endif
             // Per VFO after the decimation: its stream position, squelch,
             // MUSIC, the per-talker DoA. In wideband / independent mode
             // (no MUSIC) each decimator got data from its specific tuner
@@ -1003,6 +1096,7 @@ void DataReceiver::decimation_processor_thread() {
 
                     DecimatorManager::ProcessResult& result = results[v];
                     const auto& inst = result.instance;
+                    if (!inst) return; // withheld qualification result
                     const float block_offset_hz = vfo_blocks[v].freq_offset_hz;
 
                     try {
@@ -1218,10 +1312,18 @@ void DataReceiver::decimation_processor_thread() {
             if (digital_needs_processing) {
                 for (auto& result : results) {
                     const auto& inst = result.instance;
+#ifdef TT01_PRODUCER_COLD_QUALIFICATION
+                    const bool fixed=active_fixed[&result-results.data()];
+                    if(!digital_hint&&!fixed)continue;
+#endif
                     if (!inst || inst->digital_mode.load(std::memory_order_relaxed) == 0) continue;
                     const bool vfo_ok = !result.decimated_data.channels.empty() && result.decimated_data.min_samples > 0;
                     auto dd = inst->getDigital();
                     if (!dd) continue;
+#ifdef TT01_ROLE_QUALIFICATION
+                    const auto& manual=manual_stamps[&result-results.data()];
+                    if(!manual)continue;
+#endif
                     // array plugins (kp::Info::array): every antenna's block, not
                     // during a noise-source calibration / retune hold (like MUSIC)
                     if (vfo_ok && dd->wants_array() && !doa_is_calibrating() && !doa_retune_hold_active()) {
@@ -1238,7 +1340,11 @@ void DataReceiver::decimation_processor_thread() {
                         if (m > 0)
                             dd->push_array(ptr, m, ns, result.decimated_data.output_rate_hz,
                                            static_cast<double>(exact_tuner_hz(at)) + result.decimated_data.freq_offset_hz,
-                                           result.decimated_data.stream_pos);
+                                           result.decimated_data.stream_pos
+#ifdef TT01_ROLE_QUALIFICATION
+                                           ,manual
+#endif
+                                           );
                     }
                     const vector<complex<float>>* src = nullptr;
                     if (!vfo_ok) {
@@ -1254,6 +1360,9 @@ void DataReceiver::decimation_processor_thread() {
                     int tuner = wideband_enabled ? inst->tuner_channel.load(std::memory_order_relaxed) : 0;
                     if (tuner < 0 || tuner >= MAX_CHANNELS) tuner = 0;
                     double rf = static_cast<double>(exact_tuner_hz(tuner)) + result.decimated_data.freq_offset_hz;
+#ifdef TT01_PRODUCER_COLD_QUALIFICATION
+                    if(manual->observed_rf().bound)rf=manual->observed_rf().rf();
+#endif
                     // every antenna for a multichannel plugin (ism: each burst
                     // combined from all of them) - only when the block holds
                     // the whole coherent array: not in independent / wideband
@@ -1333,10 +1442,21 @@ void DataReceiver::decimation_processor_thread() {
                     }
                     if (n == 0 && naux == 0) continue;
                     dd->push(src ? src->data() : nullptr, n, result.decimated_data.output_rate_hz, rf,
-                             result.decimated_data.stream_pos, mc, mc_m, result.decimated_data.bandwidth_hz, aux, naux);
+                             result.decimated_data.stream_pos, mc, mc_m, result.decimated_data.bandwidth_hz, aux, naux
+#ifdef TT01_ROLE_QUALIFICATION
+                             ,manual
+#endif
+                             );
                 }
             }
 
+#ifdef TT01_PRODUCER_COLD_QUALIFICATION
+            // Any nonempty qualified manual result not terminally claimed
+            // by the actual digital enqueue path is a known discard.
+            // A successful or already refused submission is single-use.
+            for(const auto& stamp:manual_stamps)
+                if(stamp)stamp->discard_nonempty();
+#endif
             // 🗣 Voice to Text: VFOs with Transcribe on and no digital decoder
             // of voice (one that decodes voice sends it through the decoder's
             // voice tap; analog_id / pagers / adsb ... decode none: the analog
@@ -1445,6 +1565,11 @@ void DataReceiver::decimation_processor_thread() {
                     if (result.audio_out && fm_needs_processing) {
                         DecimatedFMWorkItem fm_item;
                         fm_item.vfo_id = result.decimator_id;
+#ifdef TT01_D2_MIXER_QUALIFICATION
+                        const auto idx=static_cast<size_t>(&result-results.data());
+                        if(!audio_keys[idx]||!managed_iq::audio_mix::current(*audio_keys[idx]))continue;
+                        fm_item.audio_key=audio_keys[idx];
+#endif
                         fm_item.channel_id = current_active;  // Logical channel ID (user-facing)
                         fm_item.decimation_used = result.decimated_data.decimation_used;
                         fm_item.output_rate_hz = result.decimated_data.output_rate_hz;
@@ -1718,8 +1843,14 @@ void DataReceiver::fm_processor_thread() {
         auto vfo = decimator_manager.getDecimator(work_item.vfo_id);
         if (!vfo || !vfo->audio_out.load(std::memory_order_relaxed) ||
             vfo->being_deleted.load(std::memory_order_relaxed)) continue;
+#ifdef TT01_D2_MIXER_QUALIFICATION
+        if(!work_item.audio_key||!managed_iq::audio_mix::current(*work_item.audio_key))continue;
+#endif
         auto ch = audio_mixer.channel(work_item.vfo_id);
         if (!ch) continue;
+#ifdef TT01_D2_MIXER_QUALIFICATION
+        if(!managed_iq::audio_mix::channel_matches(ch,*work_item.audio_key))continue;
+#endif
         const DemodulatorMode vfo_mode = vfo->demod_mode.load(std::memory_order_relaxed);
         ch->mode.store(vfo_mode, std::memory_order_relaxed);
         FMDemodulatorRobust& demod = ch->demod;
@@ -1739,6 +1870,9 @@ void DataReceiver::fm_processor_thread() {
         // (silence when there is none). Squelch doesn't apply - the decoder
         // only produces audio for valid voice frames.
         if (vfo_mode == DemodulatorMode::DIGITAL) {
+#ifdef TT01_D2_MIXER_QUALIFICATION
+            if(!managed_iq::audio_mix::channel_matches(ch,*work_item.audio_key))continue;
+#endif
             auto dd = vfo->getDigital();
             if (dd) dd->pull_voice(audio_samples.data(), audio_samples.size());
             else std::fill(audio_samples.begin(), audio_samples.end(), 0.0f);
@@ -1891,6 +2025,7 @@ void DataReceiver::print_raw_buffer_status() {
 }
 
 void DataReceiver::flush_data_pipeline() {
+    iq_ingress::source_epoch().invalidate();
     // Clear raw data buffer (discard all buffered IQ packets)
     raw_data_buffer.clear();
 

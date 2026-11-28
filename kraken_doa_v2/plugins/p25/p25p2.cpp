@@ -1506,8 +1506,18 @@ struct P25p2Proto::Impl {
         if (clean == 0) return;
         // the talker channel: outbound LCH n = n + 1; an inbound radio's
         // bursts are packets (no channel): -1 = unknown, never Phase 1's 0
-        if (ctx.voice_channel) ctx.voice_channel(!c.inbound && c.lch >= 0 ? c.lch + 1 : -1);
-        if (ctx.voice) ctx.voice(Mode::P25, pcm, static_cast<size_t>(160 * nf));
+#ifdef TT01_D1_PCM_WIRE
+        if(p1.trunk&&p1.trunk->typed_pcm){
+            // No inbound/unknown logical channel or inferred target.
+            // NAC 0xffff explicitly denotes unproven traffic identity.
+            if(!c.inbound&&c.lch>=0&&c.lch<2&&c.dst_known&&c.dst)
+                p1.trunk->pcm(c.dst,c.src,0xffff,2,uint8_t(c.lch+1),c.group,pcm,size_t(160*nf));
+        }else
+#endif
+        {
+            if (ctx.voice_channel) ctx.voice_channel(!c.inbound && c.lch >= 0 ? c.lch + 1 : -1);
+            if (ctx.voice) ctx.voice(Mode::P25, pcm, static_cast<size_t>(160 * nf));
+        }
         if (ctx.voice_state)
             ctx.voice_state(who + ": playing (AMBE+2, " + std::to_string(clean) + "/" + std::to_string(nf) + " frames clean)");
     }

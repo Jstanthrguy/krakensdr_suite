@@ -91,6 +91,11 @@ ifeq ($(ARCH),armv7l)
     PFFFT_CFLAGS += -mfpu=neon -DPFFFT_ENABLE_NEON
 endif
 
+# The shared SDK Host vtable and wire IDs must match every plugin TU,
+# shared library and plugin_host.o, not just the P25 decoder.
+include ../operational-profile.mk
+override CXXFLAGS += $(TT01_PLUGIN_FLAGS)
+
 # libjpeg-turbo (IJG / BSD-3-Clause / zlib): the plugin host (sdk/plugin_host.cpp)
 # compresses video frames to JPEG when it is present, which lets large (up to 4K)
 # frames fit the 1 MB pipe and cuts a static screen to ~0 bandwidth. PLUGIN-ONLY

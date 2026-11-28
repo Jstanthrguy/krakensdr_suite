@@ -15,6 +15,7 @@
 #include "sigclass_service.hpp"
 #include "sigclass_presets.hpp"
 #include "decimator_manager.hpp"
+#include "networking/managed_receiver.hpp"
 #include "scanner_manager.hpp"
 #include "continuous_scanner.hpp"
 #include "station_info.hpp"
@@ -581,8 +582,11 @@ static bool apply_decimator_snapshot(const string& snap) {
         decimator_manager.setSquelchMethod(id, v.sq_method);
         // a tuner this receiver doesn't have (a snapshot from a bigger array -
         // a KrakenSDR's VFOs on one generic dongle): tuner 0
-        if (auto inst = decimator_manager.getDecimator(id))
-            inst->tuner_channel = v.tuner < std::clamp(active_num_elements.load(), 1, MAX_CHANNELS) ? v.tuner : 0;
+        if (auto inst = decimator_manager.getDecimator(id)) {
+            auto writer = managed_iq::registry().write(inst->serial,inst);
+            if (writer && !inst->being_deleted.load())
+                inst->tuner_channel = v.tuner < std::clamp(active_num_elements.load(), 1, MAX_CHANNELS) ? v.tuner : 0;
+        }
         if (v.digital != dig::Mode::OFF) decimator_manager.setDigitalOptions(id, v.dopts);
         decimator_manager.setDigitalMode(id, v.digital, v.plugin);
         decimator_manager.setTranscribe(id, v.transcribe);
@@ -801,6 +805,8 @@ void ControlHandler::clamp_vfo_tuners() {
         if (!inst || inst->being_deleted.load()) continue;
         const int t = inst->tuner_channel.load();
         if (t < n) continue;
+        auto writer = managed_iq::registry().write(inst->serial,inst);
+        if (!writer || inst->being_deleted.load()) continue;
         inst->tuner_channel = 0;
         moved = true;
         cout << "VFO " << inst->id << ": tuner " << t << " is gone (" << n << " tuner" << (n == 1 ? "" : "s")
@@ -825,6 +831,7 @@ bool ControlHandler::apply_operating_mode_state(int mode) {
         // user's channel back
         static int channel_before = -1;
         if (changed) {
+            managed_iq::DomainWrite domain;
             if (cur == 0) channel_before = active_channel.load();
             if (mode == 0 && channel_before >= 0) {
                 if (active_channel.exchange(channel_before) != channel_before) {
@@ -847,6 +854,10 @@ bool ControlHandler::apply_operating_mode_state(int mode) {
             wideband_mode_enabled = (mode == 1);
             independent_mode_enabled = (mode == 2);
             sweep_mode_enabled = (mode == 3);
+#ifdef TT01_D2_PUBLISH_QUALIFICATION
+            if(cur==3||mode==3)managed_iq::audio_fence::discontinuity();
+#endif
+
             // the sweep engine takes the packets only in sweep mode (sweep.hpp);
             // back from it every averaged spectrum restarts (they hold the
             // bands from before the sweep)
@@ -956,6 +967,7 @@ void ControlHandler::note_server_mode(int mode) {
             (!force && steady_ms_now() - g_mode_change_ms.load(std::memory_order_relaxed) < 3000)) return;
         cout << "heimdall is in " << mode_name(mode) << " mode - following it"
              << (force ? " (generic RTL-SDRs: no coherent mode)" : "") << endl;
+        managed_iq::DomainWrite domain;
         if (mode == 2) {
             // what the tuners actually run (the header's float frequency)
             for (int i = 0; i < min(num_channels.load(), MAX_CHANNELS); i++)
@@ -1193,6 +1205,7 @@ void ControlHandler::handle_message_impl(string_view message) {
             send_control_command("{\"set_wideband_mode\":{\"enable\":false}}");
             broadcast("{\"wideband_mode\":{\"enabled\":false}}");
         }
+        managed_iq::DomainWrite domain;
         // Independent mode: a common frequency puts EVERY tuner there (heimdall's
         // set_frequency does the same); the mode stays
         if (independent_mode_enabled.load(std::memory_order_relaxed)) {
@@ -2048,8 +2061,11 @@ void ControlHandler::handle_message_impl(string_view message) {
             }
             float offset_khz = stof_finite(rest_s);
             float offset_hz = offset_khz * 1000.0f;
+            auto command_inst = decimator_manager.getDecimator(id);
+            auto command_writer = managed_iq::registry().write(command_inst ? command_inst->serial : 0,command_inst);
+            if (!command_writer || command_inst->being_deleted.load()) throw CommandRejected("no such decimator");
             if (tuner >= 0 && independent_mode_enabled.load()) {
-                auto inst = decimator_manager.getDecimator(id);
+                auto inst = command_inst;
                 if (inst && inst->tuner_channel.exchange(tuner) != tuner) {
                     cout << "Decimator " << id << " -> tuner " << tuner << endl;
                     if (decimator_manager.primaryAudioVfo() == id) active_channel = tuner;
@@ -2098,7 +2114,7 @@ void ControlHandler::handle_message_impl(string_view message) {
                     offset_hz = selected_freq_hz - best_ch_freq_hz;
 
                     // Store which tuner this decimator should use
-                    auto decimator_inst = decimator_manager.getDecimator(id);
+                    auto decimator_inst = command_inst;
                     if (decimator_inst) {
                         decimator_inst->tuner_channel = best_channel;
                         cout << "Decimator " << id << " → Tuner " << best_channel
@@ -2114,22 +2130,21 @@ void ControlHandler::handle_message_impl(string_view message) {
                 }
             }
 
-            if (decimator_manager.setFrequencyOffset(id, offset_hz)) {
+#ifdef TT01_RECEIVER_TEST
+            if(managed_iq::frequency_test_hook)managed_iq::frequency_test_hook(command_inst);
+#endif
+            if (managed_iq::set_instance_offset(command_inst, offset_hz) &&
+                decimator_manager.getDecimator(id)==command_inst && !command_inst->being_deleted.load()) {
                 cout << "Decimator " << id << " frequency offset set to " << (offset_hz / 1000.0f) << " kHz" << endl;
 
                 stringstream json;
                 json << "{\"decimator_freq_offset\":{\"id\":" << id << ",\"offset_hz\":" << ui_offset_hz;
-                if (auto inst = decimator_manager.getDecimator(id)) json << ",\"tuner\":" << inst->tuner_channel.load();
+                if (!command_inst->being_deleted.load()) json << ",\"tuner\":" << command_inst->tuner_channel.load();
                 json << "}}";
                 broadcast(json.str());
                 record_decimator_snapshot();
-            } else if (tuner >= 0) {
-                // same offset, other tuner: still tell the pages + save
-                stringstream json;
-                json << "{\"decimator_freq_offset\":{\"id\":" << id << ",\"offset_hz\":" << ui_offset_hz
-                     << ",\"tuner\":" << tuner << "}}";
-                broadcast(json.str());
-                record_decimator_snapshot();
+            } else {
+                throw CommandRejected("decimator changed during frequency command");
             }
         }
     }
@@ -2793,6 +2808,7 @@ void ControlHandler::handle_message_impl(string_view message) {
             continuous_scanner.stop();
         }
         if (mode != operating_mode_index() && sfscan::running()) sfscan::stop(string("the mode changed to ") + mode_name(mode));
+        managed_iq::DomainWrite domain;
         const bool was_coherent = operating_mode_index() == 0;
         const bool was_sweep = operating_mode_index() == 3;
         if (mode == 3) {
@@ -2863,6 +2879,7 @@ void ControlHandler::handle_message_impl(string_view message) {
                 throw CommandRejected("outside the tuner range (24-1766 MHz)");
             if (sfscan::uses_tuner(ch) && !sfscan::dispatching() && !trunk::dispatching())
                 sfscan::stop("tuner " + to_string(ch) + " was retuned by hand");
+            managed_iq::DomainWrite domain(ch);
             const double hz = static_cast<double>(llround(v * 1e6));
             indep_tuner_freq_hz[ch] = hz;
             ChannelManager::set_frequency(static_cast<float>(hz), ch);
@@ -2883,6 +2900,7 @@ void ControlHandler::handle_message_impl(string_view message) {
     else if (message.starts_with("TUNERS:")) {
         // Persisted independent-mode tuning (replay): f/g,f/g,... Applied to
         // heimdall when independent mode is (or becomes) active
+        managed_iq::DomainWrite domain;
         stringstream list{string(message.substr(7))};
         string tok;
         for (int i = 0; i < MAX_CHANNELS && getline(list, tok, ','); i++) {

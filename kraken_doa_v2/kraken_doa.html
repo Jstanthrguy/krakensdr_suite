@@ -7643,6 +7643,10 @@ class AudioEngine {
     this.volume=0.5;
     this.init=false;
     this.initPromise=null;
+    // Local playback generation spans decoder, socket, mute and worklet boundaries.
+    this.playGeneration=0n;this.resetAck=null;this.resetPosted=null;this.serial=0n;
+    this.inFlight=new Map();this.pendingPCM=[];this.resumeJob=null;this.portExpiry=null;
+    this.muted=false;this.pcmExpiry=null;
   }
   // Callers share one in-flight start-up: init only turns true after the
   // worklet loads (an await), so a second call meanwhile (a keydown right after
@@ -7664,7 +7668,7 @@ class AudioEngine {
       this.ctx=new AudioContext({sampleRate:48000});
       console.log('AudioContext created at', this.ctx.sampleRate, 'Hz');
       this.gain=this.ctx.createGain();
-      this.gain.gain.value=this.volume;
+      this.gain.gain.value=0;
       this.gain.connect(this.ctx.destination);
       await this.setupWorklet();
       this.init=true;
@@ -7714,6 +7718,7 @@ class AudioEngine {
           this.winMin=Infinity;this.winN=0;
           this.trimNow=false;
           this.underrunCount=0;
+          this.generation=null;this.serial=0n;
           this.port.onmessage=e=>this.handleMsg(e);
         }
         push(s){
@@ -7734,9 +7739,25 @@ class AudioEngine {
         }
         drop(k){this.rp=(this.rp+k)%this.cap;this.n-=k;}
         winReset(){this.winMin=Infinity;this.winN=0;}
+        clearGeneration(){
+          this.rp=this.wp=0;this.n=0;this.xa=null;
+          this.floor=BASE;this.buffering=true;this.fadeIn=false;
+          this.dryAt=-1;this.lastArr=-1;this.gapMax=0;this.lastStall=-1;
+          this.calmSince=currentTime;this.trimNow=false;this.underrunCount=0;this.winReset();
+        }
         handleMsg(e){
-          const{type,data}=e.data;
+          const{type,data}=e.data||{};
+          if(!data||typeof data.generation!=='bigint'||data.generation<0n)return;
+          if(type==='reset'){
+            if(this.generation!==null&&data.generation<=this.generation)return;
+            this.generation=data.generation;this.serial=0n;this.clearGeneration();
+            this.port.postMessage({type:'resetAck',generation:this.generation});
+            return;
+          }
           if(type==='audioData'){
+            if(data.generation!==this.generation||typeof data.serial!=='bigint'||data.serial!==this.serial+1n||
+               !(data.samples instanceof Float32Array)||!data.samples.length||data.samples.length>10000)return;
+            this.serial=data.serial;
             const now=currentTime;
             if(this.dryAt>=0 && this.lastArr>=0)this.gapMax=Math.max(this.gapMax,now-this.lastArr);
             this.lastArr=now;
@@ -7753,11 +7774,7 @@ class AudioEngine {
               this.dryAt=-1;this.gapMax=0;this.calmSince=now;this.winReset();
             }
             if(!this.buffering && this.n>this.floor+FAR)this.trimNow=true;
-          }
-          else if(type==='reset'){
-            this.rp=this.wp;this.n=0;
-            this.buffering=true;this.dryAt=-1;this.gapMax=0;this.trimNow=false;
-            this.underrunCount=0;this.winReset();
+            this.port.postMessage({type:'pcmAck',generation:this.generation,serial:this.serial});
           }
         }
         process(i,o){
@@ -7808,29 +7825,102 @@ class AudioEngine {
     const url=URL.createObjectURL(blob);
     await this.ctx.audioWorklet.addModule(url);
     this.node=new AudioWorkletNode(this.ctx,'audio-processor');
-    this.node.connect(this.gain);
+    this.resetPosted=null;
+    const node=this.node;
+    node.port.onmessage=e=>this.onWorkletAck(node,e.data);
+    node.connect(this.gain);
+    this.reset();
     URL.revokeObjectURL(url);
   }
-  async addAudioData(samples) {
-    if(!this.init)return;
-
-    // CRITICAL: Resume context if suspended
-    if(this.ctx.state==='suspended') {
-      console.warn('AudioContext was suspended, resuming...');
-      await this.ctx.resume();
-    }
-
-    if(this.node) {
-      this.node.port.postMessage({type:'audioData',data:{samples}});
+  updateGain(){
+    if(this.gain)this.gain.gain.value=(!this.muted&&this.resetAck===this.playGeneration)?this.volume:0;
+  }
+  setVolume(v){this.volume=v;this.updateGain();}
+  setMuted(on){
+    if(this.muted===on)return;
+    this.muted=on;this.reset();
+  }
+  reset(){
+    ++this.playGeneration;this.resetAck=null;this.serial=0n;
+    this.inFlight.clear();this.pendingPCM=[];clearTimeout(this.pcmExpiry);this.pcmExpiry=null;
+    clearTimeout(this.portExpiry);this.portExpiry=null;
+    this.updateGain();
+    this.postReset();
+  }
+  postReset(){
+    // Coalesce retirement while a worklet reset is outstanding. No data is
+    // posted until the latest reset is ACKed, and gain remains zero.
+    if(!this.node?.port||this.resetPosted!==null)return;
+    this.resetPosted=this.playGeneration;
+    try{this.node.port.postMessage({type:'reset',data:{generation:this.resetPosted}});}
+    catch(e){this.resetPosted=null;console.warn('audio reset post failed',e);}
+  }
+  onWorkletAck(node,m){
+    if(node!==this.node||!m)return;
+    if(m.type==='resetAck'){
+      if(m.generation!==this.resetPosted)return;
+      this.resetPosted=null;
+      if(m.generation!==this.playGeneration){this.postReset();return;}
+      this.resetAck=this.playGeneration;this.updateGain();this.drainPCM();
+    }else if(m.type==='pcmAck'&&m.generation===this.playGeneration){
+      if(!this.inFlight.delete(m.serial))return;
+      this.armPortExpiry();
+      this.drainPCM();
     }
   }
-  setVolume(v){this.volume=v;if(this.gain)this.gain.gain.value=v;}
-
-  reset() {
-    // Reset the audio worklet by sending a reset message
-    if(this.node && this.node.port) {
-      this.node.port.postMessage({type:'reset'});
+  armPortExpiry(){
+    clearTimeout(this.portExpiry);this.portExpiry=null;
+    if(!this.inFlight.size)return;
+    const gen=this.playGeneration,oldest=this.inFlight.values().next().value;
+    this.portExpiry=setTimeout(()=>{
+      if(gen===this.playGeneration&&this.inFlight.size)this.reset();
+    },Math.max(0,320-(performance.now()-oldest)));
+  }
+  addAudioData(samples,valid){
+    if(!this.init||!this.node||!this.ctx||this.muted||!valid()||
+       !(samples instanceof Float32Array)||!samples.length||samples.length>10000)return;
+    // Bound the queue while suspended, waiting for reset ACK or port ACK.
+    if(this.pendingPCM.length+this.inFlight.size>=8){this.reset();return;}
+    const entry={generation:this.playGeneration,valid,samples:samples.slice(),at:performance.now()};
+    if(!this.pendingPCM.length){
+      this.pcmExpiry=setTimeout(()=>{
+        if(entry.generation===this.playGeneration&&this.pendingPCM.length)this.reset();
+      },320);
     }
+    this.pendingPCM.push(entry);this.drainPCM();
+  }
+  drainPCM(){
+    if(!this.init||!this.ctx||!this.node||this.muted||!this.pendingPCM.length)return;
+    if(this.pendingPCM[0].generation!==this.playGeneration||performance.now()-this.pendingPCM[0].at>320){
+      this.reset();return;
+    }
+    if(this.ctx.state!=='running'){
+      if(this.ctx.state==='closed'){this.reset();return;}
+      if(this.resumeJob)return;
+      const ctx=this.ctx,node=this.node,job={ctx,node};
+      this.resumeJob=job;
+      // One outstanding resume; never post a captured PCM from its continuation.
+      // Re-enter the current queue and validate all identities after await.
+      Promise.resolve().then(()=>ctx.resume()).then(()=>{
+        if(this.resumeJob===job&&this.ctx===ctx&&this.node===node&&ctx.state==='running'){
+          this.resumeJob=null;this.drainPCM();
+        }
+      },()=>{
+        if(this.resumeJob===job&&this.ctx===ctx&&this.node===node)this.reset();
+      }).finally(()=>{if(this.resumeJob===job)this.resumeJob=null;});
+      return;
+    }
+    if(this.resetAck!==this.playGeneration){this.postReset();return;}
+    while(this.pendingPCM.length&&this.inFlight.size<8){
+      const e=this.pendingPCM.shift();
+      if(e.generation!==this.playGeneration||!e.valid()||this.muted)continue;
+      if(performance.now()-e.at>320){this.reset();return;}
+      const serial=++this.serial;
+      this.inFlight.set(serial,performance.now());this.armPortExpiry();
+      try{this.node.port.postMessage({type:'audioData',data:{generation:e.generation,serial,samples:e.samples}});}
+      catch(err){console.warn('audio PCM post failed',err);this.reset();return;}
+    }
+    if(!this.pendingPCM.length){clearTimeout(this.pcmExpiry);this.pcmExpiry=null;}
   }
 }
 audioEngine=new AudioEngine();
@@ -7875,6 +7965,194 @@ async function initOpusDecoder() {
   }
 }
 
+// D3B_AUDIO_EPOCH_BEGIN
+const AUDIO_EPOCH_MAX=0xffffffffffffffffn;
+function parseEpochAudio(buf) {
+  if(!(buf instanceof ArrayBuffer)||buf.byteLength<56||buf.byteLength>4056)throw Error('audio length');
+  const v=new DataView(buf),kind=v.getUint32(8,true),len=v.getUint32(12,true);
+  const gen=v.getBigUint64(16,true),rev=v.getBigUint64(24,true),
+        epoch=v.getBigUint64(32,true),seq=v.getBigUint64(40,true);
+  if(v.getUint32(0,true)!==12||v.getUint32(4,true)!==1||
+     (kind!==0&&kind!==1)||len!==buf.byteLength-56||
+     !gen||!rev||gen===AUDIO_EPOCH_MAX||rev===AUDIO_EPOCH_MAX||seq===AUDIO_EPOCH_MAX)
+    throw Error('audio header');
+  const count=v.getUint32(48,true),rate=v.getUint32(52,true);
+  if(kind===0 ? (len||epoch||count||rate) :
+     (!len||len>4000||!epoch||epoch===AUDIO_EPOCH_MAX||!seq||count!==1920||rate!==48000))
+    throw Error('audio fields');
+  return {kind,gen,rev,epoch,seq,opus:new Uint8Array(buf,56,len)};
+}
+class EpochAudioReceiver {
+  constructor(make,output,retired,clock=()=>performance.now()){
+    this.make=make;this.output=output;this.retired=retired;this.clock=clock;
+    this.socket=null;this.mode='legacy';this.ticket=0n;this.pending=null;this.decoder=null;
+    this.queue=[];this.expiry=null;this.negotiation=null;this.gen=0n;this.rev=0n;this.epoch=0n;this.highEpoch=0n;this.seq=0n;
+    this.subscribed=true;this.initial=false;this.failed=false;
+  }
+  owns(s){return !!s&&s===this.socket&&!this.failed;}
+  current(s,t){return this.owns(s)&&this.ticket===t;}
+  retire(){
+    ++this.ticket;this.queue=[];clearTimeout(this.expiry);this.expiry=null;
+    if(this.decoder){this.free(this.decoder);this.decoder=null;}
+    this.retired(this.ticket);
+  }
+  free(d){try{d.free();}catch(e){console.warn('epoch decoder free',e);}}
+  clearNegotiation(){clearTimeout(this.negotiation);this.negotiation=null;}
+  expectReset(s){
+    this.clearNegotiation();
+    if(this.mode==='requested'||this.subscribed)this.negotiation=setTimeout(()=>{
+      if(this.owns(s)&&(this.mode==='requested'||!this.initial))this.fault(s,'negotiation/reset timeout');
+    },2000);
+  }
+  attach(s){
+    this.clearNegotiation();this.retire();this.socket=s;this.mode='legacy';this.failed=false;
+    this.gen=this.rev=this.epoch=this.highEpoch=this.seq=0n;
+    this.subscribed=true;this.initial=false;
+  }
+  detach(s){if(s!==this.socket)return;this.clearNegotiation();this.retire();this.socket=null;this.failed=true;}
+  fault(s,why){
+    if(!this.owns(s))return false;
+    console.warn('Epoch audio refused:',why);
+    this.failed=true;this.clearNegotiation();this.retire();
+    try{s.close(4002,'audio protocol');}catch(_){}
+    return false;
+  }
+  control(s,msg){
+    if(!this.owns(s))return false;
+    if(Object.hasOwn(msg,'audio_epoch_required')){
+      if(msg.audio_epoch_required!==1)return this.fault(s,'capability');
+      if(this.mode==='legacy'){
+        this.mode='requested';this.retire();this.expectReset(s);
+        try{s.send('AUDIO_EPOCH:1');}catch(e){return this.fault(s,'negotiation send');}
+      }
+      return true;
+    }
+    if(Object.hasOwn(msg,'audio_epoch')){
+      if(msg.audio_epoch!==1||this.mode==='legacy')return this.fault(s,'ack');
+      if(this.mode==='requested'){this.mode='versioned';this.expectReset(s);}
+      return true;
+    }
+    if(msg.subscribed&&this.mode!=='legacy'){
+      if(typeof msg.subscribed.audio!=='boolean')return this.fault(s,'subscription ack');
+      if(this.subscribed!==msg.subscribed.audio){
+        this.subscribed=msg.subscribed.audio;this.initial=false;this.epoch=0n;this.retire();this.expectReset(s);
+      }
+    }
+    return false;
+  }
+  legacyAllowed(s){return this.owns(s)&&this.mode==='legacy';}
+  frame(s,buf){
+    if(!this.owns(s))return false;
+    try{
+      if(this.mode!=='versioned')throw Error('missing negotiation');
+      const f=parseEpochAudio(buf);
+      if(f.gen<this.gen||f.rev<this.rev||f.seq<this.seq)throw Error('retired frame');
+      if(f.kind===0){
+        if(f.gen===this.gen&&f.rev!==this.rev)throw Error('reset revision');
+        this.retire();this.gen=f.gen;this.rev=f.rev;this.seq=f.seq;this.epoch=0n;
+        this.initial=this.subscribed;this.clearNegotiation();return true;
+      }
+      if(!this.initial||!this.subscribed||f.rev!==this.rev||f.seq<=this.seq)throw Error('packet without reset or old sequence');
+      if(f.gen===this.gen&&this.epoch){
+        if(f.epoch!==this.epoch||f.seq!==this.seq+1n)throw Error('same epoch gap');
+      }else{
+        if(f.epoch<=this.highEpoch)throw Error('retired epoch');
+        if(f.gen!==this.gen&&this.epoch===0n)throw Error('missing epoch start');
+        this.retire();this.gen=f.gen;this.epoch=f.epoch;this.highEpoch=f.epoch;
+      }
+      this.seq=f.seq;
+      const entry={s,t:this.ticket,f,at:this.clock()};
+      if(this.decoder)return this.decode(entry);
+      if(this.queue.length>=8||(this.queue.length&&entry.at-this.queue[0].at>320))throw Error('decoder backlog');
+      if(!this.queue.length){
+        this.expiry=setTimeout(()=>{
+          if(this.current(s,entry.t)&&this.queue.length)this.fault(s,'decoder init timeout');
+        },320);
+      }
+      this.queue.push(entry);this.kick();return this.owns(s);
+    }catch(e){return this.fault(s,e.message);}
+  }
+  kick(){
+    if(this.pending||!this.queue.length||this.decoder)return;
+    const {s,t}=this.queue[0];
+    if(!this.current(s,t))return;
+    let d,ready;
+    try{d=this.make();ready=Promise.resolve(d.ready);}catch(e){if(d)this.free(d);this.fault(s,'decoder constructor');return;}
+    const job={d,s,t};this.pending=job;
+    // Do not free a half-initialized WASM instance. One outstanding init only.
+    ready.then(()=>{
+      if(!this.current(s,t)){this.free(d);return;}
+      if(!this.queue.length||this.clock()-this.queue[0].at>320){this.free(d);this.fault(s,'decoder init age');return;}
+      this.decoder=d;
+      const q=this.queue;this.queue=[];clearTimeout(this.expiry);this.expiry=null;
+      for(const entry of q){if(!this.current(s,t)||!this.decode(entry))break;}
+    },()=>{
+      this.free(d);if(this.current(s,t))this.fault(s,'decoder init failure');
+    }).finally(()=>{
+      if(this.pending===job)this.pending=null;
+      this.kick();
+    });
+  }
+  decode(entry){
+    const {s,t,f}=entry;
+    if(!this.current(s,t)||!this.decoder)return false;
+    try{
+      const out=this.decoder.decodeFrame(f.opus),samples=out?.channelData?.[0];
+      if(!(samples instanceof Float32Array)||samples.length!==1920||
+         (out.channelData.length!==1&&out.channelData.length!==2)||out.samplesDecoded!==1920||out.sampleRate!==48000||
+         out.p?.length||out.errors?.length||!samples.every(Number.isFinite))
+        throw Error('decoder result');
+      // PCM remains bound to this socket and decoder ticket through playback handoff.
+      if(this.current(s,t))this.output({socket:s,ticket:t,gen:f.gen,rev:f.rev,epoch:f.epoch,seq:f.seq,samples});
+      return this.current(s,t);
+    }catch(e){return this.fault(s,e.message);}
+  }
+}
+// D3B_AUDIO_EPOCH_END
+
+// D3C: decoder retirement and local playback retirement are separate identities.
+let localAudioRevision=null,localAudioTimer=null;
+const epochAudio=new EpochAudioReceiver(
+  ()=>new window["opus-decoder"].OpusDecoder({channels:1,sampleRate:48000,preSkip:0}),
+  pcm=>{
+    if(localAudioRevision!==null){
+      if(pcm.rev<=localAudioRevision)return;
+      clearLocalAudioBarrier();
+    }
+    audioEngine.addAudioData(pcm.samples,()=>epochAudio.current(pcm.socket,pcm.ticket)&&
+      localAudioRevision===null&&fmEnabled&&opMode!=='sweep');
+  },
+  ()=>audioEngine.reset()
+);
+function clearLocalAudioBarrier(){
+  localAudioRevision=null;clearTimeout(localAudioTimer);localAudioTimer=null;
+}
+function armLocalAudioBarrier(){
+  clearTimeout(localAudioTimer);localAudioTimer=null;
+  if(localAudioRevision===null||!fmEnabled||opMode==='sweep')return;
+  const socket=epochAudio.socket,floor=localAudioRevision;
+  localAudioTimer=setTimeout(()=>{
+    if(epochAudio.owns(socket)&&localAudioRevision===floor&&epochAudio.rev<=floor)
+      epochAudio.fault(socket,'local audio boundary not observed');
+  },2000);
+}
+function audioLocalBoundary(waitAuthority=false){
+  if(waitAuthority&&epochAudio.mode==='versioned'){
+    localAudioRevision=epochAudio.rev;armLocalAudioBarrier();
+  }
+  audioEngine.reset();
+}
+function audioLocalGate(){
+  audioEngine.setMuted(!fmEnabled||opMode==='sweep');
+  armLocalAudioBarrier();
+}
+function audioCommandBoundary(msg){
+  // Commands are not acknowledgements. Gate versioned playback until a newer
+  // observed authority revision, not merely the next packet of the old epoch.
+  if(/^(FM:|AUDIO_VFO:|SET_AUDIO_VFOS:|SET_FM_DECIMATOR:|SET_DECIMATOR_FREQ:|SET_DECIMATOR_DEMOD:|SET_DECIMATOR_BW:|SET_DECIMATOR_BW_HZ:|FREQ:|TUNER_FREQ:|CHANNEL:|OPERATING_MODE:|REMOVE_DECIMATOR:|TRUNK_FOLLOW:|TRUNK_AUDIO:|TRUNK_RETUNE:|PLAYBACK_START:|PLAYBACK_OPEN:|PLAYBACK_PAUSE:|PLAYBACK_SEEK:|PLAYBACK_STOP$)/.test(msg))
+    audioLocalBoundary(true);
+}
+
 // Helper function to reset audio worklet
 function resetAudioWorklet() {
   if(audioEngine && audioEngine.init) {
@@ -7888,7 +8166,7 @@ function $id(id){return document.getElementById(id);}
 // outgoing sends are dropped: the backend already has the new state, and
 // re-sending would ping-pong the change between browsers forever.
 let applyingRemote=false;
-function send(msg){if(applyingRemote)return;if(ws&&ws.readyState===1)ws.send(msg);}
+function send(msg){if(applyingRemote)return;if(ws&&ws.readyState===1){audioCommandBoundary(msg);ws.send(msg);}}
 function sendUI(key,val){send('UI:'+key+':'+val);}
 
 // DOA polar-plot angle convention ('unit' | 'compass'), shared by all plots and
@@ -9850,6 +10128,7 @@ function sgn() {
 // follow fmEnabled on their own.
 function tfm() {
   fmEnabled=!fmEnabled;
+  audioLocalGate();
   const b=$id('fmt');
   b.className='tb-btn tb-spk '+(fmEnabled?'on':'off');
   b.setAttribute('aria-pressed', fmEnabled ? 'true' : 'false');
@@ -12278,9 +12557,12 @@ function connect() {
   // phone on a no-internet hotspot) never fires onclose and would sit in
   // CONNECTING forever. Cap it; onclose then schedules the normal retry.
   const attempt=ws;
+  clearLocalAudioBarrier();
+  epochAudio.attach(attempt);
   setTimeout(()=>{if(attempt===ws&&attempt.readyState===WebSocket.CONNECTING)attempt.close();},6000);
 
   ws.onopen=()=>{
+    if(attempt!==ws)return;
     tkCcAsked = false;   // 📡 (the memory: asked again on the first status of this connection)
     tkCcNewConn();       // 📡 (entry ids are the receiver's per start: nothing keyed by them carries over)
     netOnOpen();   // the Display box's "Data rate": counted anew for the new connection
@@ -12351,6 +12633,9 @@ function connect() {
   };
   
   ws.onclose=()=>{
+    if(attempt!==ws)return;
+    clearLocalAudioBarrier();
+    epochAudio.detach(attempt);
     netOnClose();   // (no rate without a connection)
     swpGainRender(); swpDrawSoon();   // ("not connected": the receiver's word isn't current)
     pwOnClose();
@@ -12362,10 +12647,11 @@ function connect() {
       connEl.style.background='#983b38';
       connEl.style.color='#fff';
     }
-    setTimeout(connect,2000);
+    setTimeout(()=>{if(attempt===ws)connect();},2000);
   };
   
   ws.onmessage=(e)=>{
+    if(attempt!==ws||!epochAudio.owns(attempt))return;
     // the Display box's "Data rate" - the one place every message passes: a binary one's bytes, a text
     // one's characters (JSON, nearly all ASCII: = its UTF-8 bytes)
     const d0 = e.data;
@@ -12375,6 +12661,7 @@ function connect() {
       if(typeof e.data === 'string') {
         try {
           const msg = JSON.parse(e.data);
+          if(epochAudio.control(attempt,msg)||!epochAudio.owns(attempt))return;
           if (msg.net && typeof msg.net === 'object') { netOnStats(msg.net); return; }   // (NET_STATS: the Display box's "Data rate")
 
           // API auth (see askForToken)
@@ -12685,7 +12972,9 @@ function connect() {
       if(mt===10) { swpOnFrame(v, e.data); return; }   // sweep mode's spectrum (SWEEP MODE)
       if(mt===SWP_FULL_TYPE) { swpOnFull(v, e.data); return; }   // sweep mode's full resolution (SWEEP MODE)
       
+      if(mt===12){epochAudio.frame(attempt,e.data);return;}
       if(mt===1) {
+        if(!epochAudio.legacyAllowed(attempt)){epochAudio.fault(attempt,'legacy audio on versioned connection');return;}
         if(e.data.byteLength<16)return; // Minimum: 4 fields (msgType, sampleCount, sampleRate, opusSize)
         const sc=v.getUint32(o,true);o+=4;  // Original sample count
         const sr=v.getFloat32(o,true);o+=4; // Sample rate
@@ -12729,7 +13018,8 @@ function connect() {
                 window.firstAudioLogged = true;
               }
 
-              audioEngine.addAudioData(samples);
+              const ticket=epochAudio.ticket;
+              audioEngine.addAudioData(samples,()=>epochAudio.current(attempt,ticket)&&epochAudio.legacyAllowed(attempt)&&fmEnabled&&opMode!=='sweep');
             }
           } catch(err) {
             console.error('Opus decode error:', err);
@@ -13059,6 +13349,7 @@ function applyOpModeUI(m) {
   if (m !== 'wideband' && m !== 'independent' && m !== 'sweep') m = 'coherent';
   const changed = m !== opMode, prev = opMode;
   opMode = m;
+  audioLocalGate();
   widebandEnabled = (m === 'wideband');
   const b = document.body;
   b.classList.toggle('mode-coherent', m === 'coherent');

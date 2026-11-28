@@ -139,6 +139,8 @@ public:
 
     // Add/remove decimators dynamically
     int addDecimator();
+    // Reserve producer ownership before the new instance enters the list.
+    int addDecimator(bool managed_producer);
     bool removeDecimator(int id);
 
     // Get decimator by ID (shared_ptr keeps it alive past removeDecimator)

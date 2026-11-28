@@ -9,6 +9,28 @@
 // commands, never saved), the state machine (tick(), every TICK_MS).
 
 #include "trunk_follow.hpp"
+#include "managed_iq_provenance.hpp"
+#ifdef TT01_MANUAL_OUTPUT_QUALIFICATION
+#include "networking/manual_output_audit.hpp"
+#ifdef TT01_K_TYPED_CONTROL_QUALIFICATION
+#include "networking/p25_control_evidence.hpp"
+#ifdef TT01_D1_PCM_QUALIFICATION
+#include "networking/managed_pcm.hpp"
+#ifndef TT01_L_BOUNDED_QUALIFICATION
+#error D1 requires L bounded native placement
+#endif
+#endif
+#ifndef TT01_K_SHADOW_QUALIFICATION
+#error typed control requires K ordered shadow lane
+#endif
+#endif
+#endif
+#ifdef TT01_EVENT_AUDIT_QUALIFICATION
+#include "networking/managed_event_audit.hpp"
+#ifdef TT01_LIFECYCLE_QUALIFICATION
+#include "networking/managed_lifecycle.hpp"
+#endif
+#endif
 
 #include "config.hpp"
 #include "channel_manager.hpp"
@@ -56,6 +78,13 @@
 #include <sstream>
 #include <unordered_map>
 #include <vector>
+#ifdef TT01_K_SHADOW_QUALIFICATION
+#include <variant>
+#include <limits>
+#if !defined(TT01_MANUAL_OUTPUT_QUALIFICATION) || !defined(TT01_LIFECYCLE_QUALIFICATION)
+#error K shadow requires the integrated native J lanes
+#endif
+#endif
 
 extern std::atomic<float> current_edge_clip;   // main.cpp
 
@@ -299,6 +328,8 @@ const char* cstate_name(int s) {
     return s == SETUP ? "setup" : s == ACTIVE ? "active" : s == HANG ? "hang" : s == RECENT ? "recent" : "wait";
 }
 
+enum class VoiceCallReport { None, Active, Ended };
+
 struct Call {
     uint64_t id = 0;
     std::string sys, key;
@@ -319,16 +350,22 @@ struct Call {
     int64_t t0_wall = 0;                    // first grant (epoch ms)
     int64_t t_start = 0, t_grant = 0, t_state = 0, t_activity = 0, t_placed = 0, t_hang = 0;
     int64_t t_rx_grant = 0;                 // when the latest grant reached the loop (latency)
-    int64_t t_call_active = 0, t_call_ended = 0;   // CALL from the voice VFO
+    int64_t t_call_active = 0;              // age of latest accepted ACTIVE
+    VoiceCallReport call_report = VoiceCallReport::None; // last accepted CALL in this placement
     bool user_ended = false;                // TRUNK_END / its VFO removed by hand: not rejoined
     bool setup_failed = false;              // SETUP gave up: not followed again
     bool ever_followed = false, counted = false;
     std::string lost;                       // this over: why it lost its voice VFO ("" = it didn't)
     bool pending_place = false;             // re-placement waiting for PLACE_MIN_MS
+    bool tentative = false;                 // update-only revival, not yet confirmed
+    int64_t t_initial_rx = 0;               // latest non-update grant for this target/over
     int moves = 0;
     std::string end;                        // RECENT: how it ended
     int64_t t_end = 0;                      // RECENT: when (steady)
     int overs = 0;                          // grants that started it again (transmission trunking)
+#ifdef TT01_K_PLACEMENT_QUALIFICATION
+    bool native_control=false;
+#endif
     bool guard = false;                     // RECENT: it was followed (or a duplicate of a followed one): trailing updates ignored
 };
 std::map<uint64_t, Call> g_calls;
@@ -349,6 +386,7 @@ std::string call_key(const std::string& sys, int site, bool group, const std::st
 struct Voice {
     int vfo = -1;
     std::weak_ptr<Inst> inst;
+    std::shared_ptr<managed_iq::Publication> publication; // per managed instance
     uint64_t dec = 0;                       // its decoder's serial (DecimatorInstance::digital_serial)
     uint64_t call = 0;                      // 0 = parked
     uint64_t last_call = 0;                 // the call it had last (its next over gets it back)
@@ -374,9 +412,16 @@ struct Voice {
     // can't end the new one)
     bool same_place = false;
     bool active_here = false;               // since the latest placement: CALL ACTIVE, valid frames or the analogue squelch
+#ifdef TT01_LIFECYCLE_QUALIFICATION
+    managed_iq::lifecycle::Cursor lifecycle;
+    std::shared_ptr<const managed_iq::EventBatch> lifecycle_evidence;
+#endif
 };
 std::vector<Voice> g_voices;
 void park(Voice& v);
+#ifdef TT01_L_BOUNDED_QUALIFICATION
+bool park_checked(Voice& v);
+#endif
 
 // --- the VFOs that report (control / traffic) -------------------------------
 struct Track {
@@ -454,10 +499,420 @@ struct QEv {
     std::string plugin;
     PluginEvent ev;
     int64_t t_rx;
+#ifdef TT01_K_SHADOW_QUALIFICATION
+    uint64_t order=0;
+#endif
+#ifdef TT01_OPERATIONAL_BUILD
+    std::shared_ptr<const managed_iq::ManualEnvelope> ordinary_stamp;
+    std::shared_ptr<managed_iq::manual_output::Generation> ordinary_generation;
+#endif
 };
 std::mutex g_qmu;
+#ifdef TT01_K_SHADOW_QUALIFICATION
+// g_qmu owns allocation and queue insertion; no wrap, no order from RF time.
+uint64_t g_ingress_next=1;
+constexpr uint64_t NO_INGRESS=std::numeric_limits<uint64_t>::max();
+template<class T>struct OrderedIngress {uint64_t order; T value;};
+template<class T>using NativeIngress=OrderedIngress<T>;
+#else
+template<class T>using NativeIngress=T;
+#endif
 std::deque<QEv> g_queue;
 bool g_drain_posted = false;
+#ifdef TT01_MANUAL_OUTPUT_QUALIFICATION
+#ifdef TT01_K_TYPED_CONTROL_QUALIFICATION
+struct TypedReport{
+    int vfo=-1;
+    int64_t at=0;
+    p25_control::Observation observation;
+    std::shared_ptr<const managed_iq::ManualEnvelope> stamp;
+    std::shared_ptr<managed_iq::manual_output::Generation> runner;
+};
+using ManualItem=std::variant<managed_iq::manual_output::Report,TypedReport>;
+#else
+using ManualItem=managed_iq::manual_output::Report;
+#endif
+std::deque<NativeIngress<ManualItem>> g_manual_output;
+managed_iq::manual_output::Stats g_manual_output_stats;
+#ifdef TT01_K_SHADOW_QUALIFICATION
+// Manager-owned, bounded, non-authorizing control origin record. The
+// original envelope remains the domain/role admission proof, not the
+// latest decoder configuration or the legacy Track/catalog.
+bool searching();
+bool scanning();
+namespace kshadow {
+namespace mo=managed_iq::manual_output;
+struct Origin {
+    uint64_t id=0,instance=0,decoder=0;
+    std::weak_ptr<Inst> inst;
+    std::shared_ptr<const managed_iq::ManualEnvelope> stamp;
+    std::shared_ptr<mo::Generation> runner;
+    managed_iq::DomainStamp domain;
+    std::string config;
+};
+std::array<Origin,VFO_LIMIT> origins{};
+#ifdef TT01_K_TYPED_CONTROL_QUALIFICATION
+std::array<p25_control::Catalog,VFO_LIMIT> catalogs{};
+#endif
+uint64_t next=1;
+bool in_range(int vfo){return vfo>=0&&vfo<VFO_LIMIT;}
+bool same_domain(const managed_iq::DomainStamp& a,const managed_iq::DomainStamp& b){
+    return a.tuner==b.tuner&&a.source==b.source&&a.selected==b.selected;
+}
+bool same_rf(const managed_iq::ManualRf& a,const managed_iq::ManualRf& b){
+    // Sample count belongs to the input operation, not the generation.
+    return a.bound&&b.bound&&a.center==b.center&&a.offset==b.offset&&
+           a.rate==b.rate&&a.bandwidth==b.bandwidth;
+}
+bool fixed(const mo::Report& e,const std::shared_ptr<Inst>& inst,
+           const std::shared_ptr<dig::DigitalDecoder>& dd,
+           const std::shared_ptr<managed_iq::Publication>& pub){
+    if(!in_range(e.vfo)||!inst||!dd||!pub||!e.stamp||!e.generation)return false;
+    const auto& st=*e.stamp;const auto& rf=st.observed_rf();const auto t=st.tuner();
+    return e.plugin=="p25"&&st.plugin()=="p25"&&st.mode()==dig::Mode::PLUGIN&&
+        st.role().role==managed_iq::Role::manual&&st.segment()&&st.seq()&&
+        e.generation->pub==pub&&e.generation->loss==st.loss_epoch()&&
+        st.authority()==pub&&st.decoder_identity()==dd.get()&&
+        inst->id==e.vfo&&e.decoder&&inst->digital_serial.load()==e.decoder&&
+        !inst->being_deleted.load()&&inst->enabled.load()&&
+        operating_mode_index()==2&&!playback::active()&&!g_paused&&!searching()&&!scanning()&&now_ms()>=g_fence_until&&
+        !trunk::is_trunk_vfo(e.vfo)&&
+        t>=0&&t<MAX_CHANNELS&&t<active_num_elements.load()&&
+        t==inst->tuner_channel.load()&&rf.bound&&rf.count&&
+        std::isfinite(rf.center)&&rf.center>0&&std::isfinite(rf.offset)&&
+        std::isfinite(rf.rate)&&rf.rate>0&&rf.bandwidth>0&&
+        rf.center==static_cast<float>(tuner_frequencies[t].load())&&
+        rf.offset==inst->frequency_offset_hz.load()&&rf.bandwidth==inst->bandwidth_hz.load()&&
+        rf.rate==SAMPLE_RATE/decimation_for_bandwidth(rf.bandwidth)&&
+        inst->digital_mode.load()==static_cast<int>(dig::Mode::PLUGIN)&&
+        dd->mode()==dig::Mode::PLUGIN&&dd->plugin_id()=="p25"&&
+        dig::options_to_string(dd->options())==dig::options_to_string(st.options());
+}
+bool same(const Origin& o,const Origin& n){
+    return o.id&&o.instance==n.instance&&o.decoder==n.decoder&&
+        !o.inst.owner_before(n.inst)&&!n.inst.owner_before(o.inst)&&o.runner==n.runner&&
+        o.stamp->authority()==n.stamp->authority()&&
+        o.stamp->decoder_identity()==n.stamp->decoder_identity()&&
+        o.stamp->role()==n.stamp->role()&&o.stamp->source()==n.stamp->source()&&
+        o.stamp->wire()==n.stamp->wire()&&o.stamp->segment()==n.stamp->segment()&&
+        o.stamp->loss_epoch()==n.stamp->loss_epoch()&&
+        same_domain(o.domain,n.domain)&&same_rf(o.stamp->observed_rf(),n.stamp->observed_rf())&&
+        o.config==n.config;
+}
+// fixed() performs external readback before admission. The envelope's
+// nonzero segment admits under epoch -> domain -> publication -> runner.
+// Domain capture below is made only inside that exact admitted action.
+void consume(const mo::Report& e,const std::shared_ptr<Inst>& inst,
+             const std::shared_ptr<dig::DigitalDecoder>& dd,
+             const std::shared_ptr<managed_iq::Publication>& pub
+#ifdef TT01_K_TYPED_CONTROL_QUALIFICATION
+             ,const TypedReport* typed=nullptr
+#endif
+             ){
+    if(
+#ifdef TT01_K_TYPED_CONTROL_QUALIFICATION
+       (!typed&&
+#endif
+       (e.event.kind==PluginEvent::CALL||e.event.kind==PluginEvent::RESET)
+#ifdef TT01_K_TYPED_CONTROL_QUALIFICATION
+       )
+#endif
+       ||!fixed(e,inst,dd,pub))return;
+    Origin candidate;
+    candidate.instance=inst->serial;candidate.decoder=e.decoder;
+    candidate.inst=inst;candidate.stamp=e.stamp;candidate.runner=e.generation;
+    candidate.config=dig::options_to_string(e.stamp->options());
+    // Retain displaced evidence until after admission locks are released.
+    Origin previous;
+    mo::admit_report(*e.stamp,dd.get(),pub,e.generation,[&]{
+        candidate.domain=managed_iq::domains().capture_locked(e.stamp->tuner());
+        auto& old=origins[e.vfo];
+        const bool equal=same(old,candidate);
+        if(equal&&e.stamp->seq()<old.stamp->seq())return false;
+        if(e.event.kind==PluginEvent::SYSTEM&&!e.event.control
+#ifdef TT01_K_TYPED_CONTROL_QUALIFICATION
+            &&!typed
+#endif
+        ){
+            if(equal)previous=std::move(old),old=Origin{};
+            return true;
+        }
+        if(equal)candidate.id=old.id;
+        else{
+            // Legacy SYSTEM/control is only a candidate origin marker,
+            // never observed network/site proof or grant eligibility.
+            bool start=e.event.kind==PluginEvent::SYSTEM&&e.event.control;
+#ifdef TT01_K_TYPED_CONTROL_QUALIFICATION
+            if(typed)start=typed->observation.kind==p25_control::Kind::network||
+                           typed->observation.kind==p25_control::Kind::site;
+#endif
+            if(!start||next==std::numeric_limits<uint64_t>::max())return false;
+            candidate.id=next++;
+        }
+        previous=std::move(old);old=std::move(candidate);
+#ifdef TT01_K_TYPED_CONTROL_QUALIFICATION
+        if(typed){
+            auto& c=catalogs[e.vfo];
+            if(c.origin==old.id&&c.last&&typed->at<c.last)return false;
+            // A silent control interval expires the entire typed catalog,
+            // not only its last grant. Require new network/site and IDEN.
+            if(c.origin==old.id&&c.last&&typed->at-c.last>=CONTROL_LOST_MS)
+                c.clear(old.id,-1);
+            c.observe(old.id,typed->observation,typed->at);
+        }
+#endif
+        return true;
+    });
+}
+uint64_t current(int vfo){
+    if(!in_range(vfo))return 0;
+    const auto& o=origins[vfo];if(!o.id)return 0;
+    auto inst=decimator_manager.getDecimator(vfo);
+    if(!inst||inst!=o.inst.lock()||inst->serial!=o.instance)return 0;
+    auto dd=inst->getDigital();
+    // lookup() intentionally hides manual publications. Use the exact
+    // live owner's registry state, then require the original pointer and
+    // retained role/source/domain/runner admission, never a new authority.
+    auto pub=managed_iq::registry().state(inst->serial,inst);
+    mo::Report check{vfo,o.decoder,"p25",{},o.stamp,o.runner};
+    if(!fixed(check,inst,dd,pub))return 0;
+    return mo::admit_report(*o.stamp,dd.get(),pub,o.runner,[&]{
+        return same_domain(o.domain,managed_iq::domains().capture_locked(o.stamp->tuner()));
+    })?o.id:0;
+}
+#ifdef TT01_K_TYPED_CONTROL_QUALIFICATION
+// Only the manager reads this snapshot. The candidate is not durable grant
+// authority: it must pass current origin and host-receipt freshness again.
+p25_control::Catalog catalog(int vfo){
+    if(!in_range(vfo))return {};
+    auto c=catalogs[vfo];
+    if(!current(vfo)||c.origin!=origins[vfo].id){
+        c.clear(0,-1);return c;
+    }
+    const auto now=now_ms();
+    if(c.last&&now-c.last>=CONTROL_LOST_MS)c.clear(c.origin,-1);
+    else if(c.latest&&now-c.latest->at>=GRANT_FRESH_MS)c.latest.reset();
+    return c;
+}
+#ifdef TT01_K_PLACEMENT_QUALIFICATION
+void native_grant(int ctl,const p25_control::Proof&);
+#endif
+void consume_typed(const TypedReport& t){
+    auto inst=decimator_manager.getDecimator(t.vfo);
+    auto dd=inst?inst->getDigital():nullptr;
+    auto pub=inst?managed_iq::registry().state(inst->serial,inst):nullptr;
+    if(!inst||!dd||!pub||!t.stamp||now_ms()-t.at>CONTROL_LOST_MS)return;
+    // Identity readback only: the original decoder, publication and runner
+    // must independently admit under the exact original stamp.
+    mo::Report proof{t.vfo,inst->digital_serial.load(),"p25",{},t.stamp,t.runner};
+#ifdef TT01_K_PLACEMENT_QUALIFICATION
+    const auto before=catalogs[t.vfo].serial;
+#endif
+    consume(proof,inst,dd,pub,&t);
+#ifdef TT01_K_PLACEMENT_QUALIFICATION
+    // Explicit standard group voice grants have exactly one entry; other
+    // grant forms remain audit-only at this first placement boundary.
+    if(t.observation.kind==p25_control::Kind::grant&&catalogs[t.vfo].serial>before){
+        auto c=catalog(t.vfo);
+        if(c.latest&&c.latest->serial>before)native_grant(t.vfo,*c.latest);
+    }
+#endif
+}
+#endif
+#ifdef TT01_K_TYPED_CONTROL_QUALIFICATION
+// Shadow dependency on an exact existing fixture placement. No native
+// grant placement here; the eventual transaction must install this before
+// any dependent voice evidence is admitted.
+struct Dependency{
+    int ctl=-1;
+    Origin control;
+    p25_control::Proof proof;
+    managed_iq::Snapshot voice;
+    std::shared_ptr<managed_iq::Publication> voice_pub;
+#ifdef TT01_L_BOUNDED_QUALIFICATION
+    managed_iq::RoleStamp voice_role{};
+#endif
+};
+std::array<std::optional<Dependency>,VFO_LIMIT> dependencies{};
+const Dependency* dependency(int vfo,const managed_iq::Snapshot& p){
+    if(!in_range(vfo)||!p)return nullptr;
+    const auto& d=dependencies[vfo];
+    return d&&d->voice==p?&*d:nullptr;
+}
+bool control_preflight(const Dependency& d){
+    auto c=catalog(d.ctl);
+    return c.retains(d.proof)&&current(d.ctl)==d.control.id;
+}
+// Called only inside existing voice admission (epoch -> domain -> voice
+// publication -> voice runner). The shared domain lock serializes all such
+// combined admissions. Never reenter epoch/domain or use the same pub.
+// No existing control action takes a voice lock, and no callbacks/I/O here.
+template<class F>bool origin_locked(const Origin& o,const std::shared_ptr<managed_iq::Publication>& voice_pub,
+                                   uint64_t voice_instance,F&& f){
+    const auto& st=*o.stamp;
+    if(voice_pub==st.authority()||o.instance==voice_instance||
+       !iq_ingress::source_epoch().valid(st.source())||
+       !iq_ingress::continuity_epoch().valid(st.wire())||
+       !managed_iq::domains().after_locked(o.domain,st.seq()))return false;
+    return st.authority()->admit_manual_after(st.role(),st.seq(),[&]{
+        return o.runner->admit(std::forward<F>(f));
+    });
+}
+template<class F>bool control_locked(const Dependency& d,F&& f){
+    return origin_locked(d.control,d.voice_pub,d.voice->tuple.instance,std::forward<F>(f));
+}
+#ifdef TT01_K_PLACEMENT_QUALIFICATION
+struct Intent{int ctl;Origin control;p25_control::Proof proof;};
+void (*placement_hook)(int,int)=nullptr; // isolated harness only; never under authority locks
+bool fresh(const Intent& i){
+    auto c=catalog(i.ctl);
+    return i.control.id==i.proof.origin&&c.retains(i.proof)&&
+        c.latest&&c.latest->serial==i.proof.serial&&
+        now_ms()-i.proof.at<GRANT_FRESH_MS&&current(i.ctl)==i.control.id;
+}
+managed_iq::Snapshot publish(const Intent& i,int vfo,const std::shared_ptr<managed_iq::Publication>& pub,
+        uint64_t ticket,const managed_iq::Tuple& expected,const managed_iq::Tuple& applied,
+        const managed_iq::Target& target,bool commands_ok,managed_iq::CenterEvidence center){
+    if(!fresh(i)||!in_range(vfo)||!pub||pub==i.control.stamp->authority())return {};
+    Dependency dep{i.ctl,i.control,i.proof,{},pub};
+#ifdef TT01_L_BOUNDED_QUALIFICATION
+    auto role=pub->capture_role();
+    if(!role||role->role!=managed_iq::Role::managed)return {};
+    dep.voice_role=*role;
+#endif
+    auto st=i.control.stamp;
+    managed_iq::Snapshot published;
+    iq_ingress::admit_epochs(st->source(),st->wire(),[&]{
+        published=pub->commit_guarded(ticket,expected,applied,target,
+            managed_iq::ingress_highwater.load(std::memory_order_acquire),commands_ok,center,
+            [&](const managed_iq::Snapshot& candidate,auto&& action){
+                return origin_locked(i.control,pub,expected.instance,[&]{
+                    if(now_ms()-i.proof.at>=GRANT_FRESH_MS)return false;
+                    // Install dependency before publication becomes visible.
+                    dep.voice=candidate;dependencies[vfo]=std::move(dep);
+                    return action();
+                });
+            });
+        return bool(published);
+    });
+    return published;
+}
+#endif
+template<class F>bool voice_admit(int vfo,const managed_iq::EventStamp& stamp,
+                                  const dig::DigitalDecoder* dd,F&& f){
+    const auto* d=dependency(vfo,stamp.provenance.placement);
+    if(!d){
+#ifdef TT01_K_PLACEMENT_QUALIFICATION
+        auto it=g_calls.find(stamp.provenance.placement->expected.id);
+        if(it!=g_calls.end()&&it->second.native_control)return false;
+#endif
+        return stamp.admit(dd,std::forward<F>(f)); // inherited explicit fixture lane
+    }
+    if(!control_preflight(*d)||stamp.source!=d->control.stamp->source()||
+       stamp.wire!=d->control.stamp->wire())return false;
+    return stamp.admit(dd,[&]{return control_locked(*d,std::forward<F>(f));});
+}
+bool dependency_current(const Dependency& d){
+    if(!control_preflight(d))return false;
+    auto role=d.voice_pub->capture_role();
+    if(!role||role->role!=managed_iq::Role::managed)return false;
+    return iq_ingress::admit_epochs(d.control.stamp->source(),d.control.stamp->wire(),[&]{
+        return d.voice_pub->admit(d.voice,*role,[&]{return control_locked(d,[]{return true;});});
+    });
+}
+#ifdef TT01_INTEGRATED_TEST_SEAM
+bool bind(int ctl,int vfo){
+    if(!in_range(ctl)||!in_range(vfo)||ctl==vfo)return false;
+    auto c=catalog(ctl);if(!c.latest||!c.retains(*c.latest))return false;
+    const auto& proof=*c.latest;
+    auto vi=decimator_manager.getDecimator(vfo);
+    auto vp=vi?managed_iq::registry().lookup(vi->serial,vi):nullptr;
+    auto p=vp?vp->snapshot():nullptr;
+    const auto& o=origins[ctl];
+    if(!p||!o.id||p->tuple.instance==o.instance||vp==o.stamp->authority()||
+       p->tuple.plugin!="p25"||p->expected.site!=ctl||
+       p->expected.target_key!=std::to_string(proof.grant.target)||
+       p->expected.group!=proof.grant.group||p->expected.slot!=proof.slot||
+       p->expected.channel!=std::to_string(proof.grant.channel>>12)+"-"+std::to_string(proof.grant.channel&4095)||
+       std::fabs(double(p->tuple.requested_center)+p->tuple.offset-double(proof.down))>1.0)return false;
+    char sys[32],nac[8],wacn[8],sid[8];
+    snprintf(sys,sizeof sys,"p25:%05X.%03X",proof.wacn,proof.sys);
+    snprintf(nac,sizeof nac,"%03X",proof.nac);
+    snprintf(wacn,sizeof wacn,"%05X",proof.wacn);
+    snprintf(sid,sizeof sid,"%03X",proof.sys);
+    auto opt=[&](const char* key,const std::string& value){
+        auto it=p->tuple.options.find(key);return it!=p->tuple.options.end()&&it->second==value;
+    };
+    if(p->expected.system!=sys||!opt("p25.nac",nac)||!opt("p25.wacn",wacn)||
+       !opt("p25.sysid",sid)||!opt("p25.phase",std::to_string(proof.phase))||
+       !opt("p25.lch",std::to_string(proof.lch)))return false;
+    if(dependency(vfo,p))return false; // never rebind a lost existing placement
+    Dependency d{ctl,o,proof,p,vp};
+    if(!dependency_current(d))return false;
+    dependencies[vfo]=std::move(d);return true;
+}
+#endif // TT01_INTEGRATED_TEST_SEAM
+#endif
+} // namespace kshadow
+#endif
+void consume_manual_output(managed_iq::manual_output::Report& e){
+    namespace mo=managed_iq::manual_output;
+        if(mo::hook)mo::hook(mo::Stage::before_audit,e);
+        auto inst=decimator_manager.getDecimator(e.vfo);
+        auto dd=inst?inst->getDigital():nullptr;
+        auto pub=inst?managed_iq::registry().state(inst->serial,inst):nullptr;
+        bool matched=inst&&dd&&pub&&!inst->being_deleted.load()&&
+            inst->digital_serial.load()==e.decoder&&e.stamp&&
+            mo::admit_report(*e.stamp,dd.get(),pub,e.generation,[&]{
+                std::lock_guard lock(g_qmu);++g_manual_output_stats.matched;return true;
+            });
+#ifdef TT01_K_SHADOW_QUALIFICATION
+        if(matched)kshadow::consume(e,inst,dd,pub);
+#endif
+        if(!matched){std::lock_guard lock(g_qmu);++g_manual_output_stats.stale;}
+        if(mo::hook)mo::hook(matched?mo::Stage::matched:mo::Stage::stale,e);
+}
+#ifndef TT01_K_SHADOW_QUALIFICATION
+void drain_manual_output(){
+    std::deque<managed_iq::manual_output::Report> q;
+    {std::lock_guard lock(g_qmu);q.swap(g_manual_output);}
+    for(auto& e:q)consume_manual_output(e);
+}
+#endif
+#endif
+#ifdef TT01_EVENT_AUDIT_QUALIFICATION
+#ifdef TT01_D1_PCM_QUALIFICATION
+using VoiceItem=std::variant<std::shared_ptr<const managed_iq::EventBatch>,std::shared_ptr<const managed_iq::pcm::Batch>>;
+namespace pcm_lane {
+namespace pc=managed_iq::pcm;
+struct Buffer{
+#ifdef TT01_D2_MANAGER_QUALIFICATION
+    pc::DeliveryQueue delivery;
+    std::optional<pc::DeliveryKey> key;
+#else
+    std::deque<std::shared_ptr<const pc::Batch>> batches;
+    size_t samples=0;
+#endif
+    pc::Stats counts;
+};
+std::array<Buffer,VFO_LIMIT> buffers{};
+void clear(int vfo){if(kshadow::in_range(vfo)){auto& b=buffers[vfo];
+#ifdef TT01_D2_MANAGER_QUALIFICATION
+    b.delivery.clear();
+#else
+    b.batches.clear();b.samples=0;
+#endif
+}}
+}
+#else
+using VoiceItem=std::shared_ptr<const managed_iq::EventBatch>;
+#endif
+std::deque<NativeIngress<VoiceItem>> g_event_audit;
+managed_iq::event_audit::Stats g_event_audit_stats;
+#ifdef TT01_LIFECYCLE_QUALIFICATION
+managed_iq::lifecycle::Stats g_lifecycle_stats;
+#endif
+#endif
 
 // tests: the last events per VFO
 std::mutex g_recent_mu;
@@ -610,14 +1065,29 @@ Place place_for(double hz, double bw, int prefer) {
     return p;
 }
 
-void dispatch(const std::vector<std::string>& cmds) {
-    const bool was = g_dispatching;
-    g_dispatching = true;
+bool dispatch(const std::vector<std::string>& cmds, bool stop_on_error = false) {
+    struct Guard {
+        bool was = g_dispatching;
+        Guard() { g_dispatching = true; }
+        ~Guard() { g_dispatching = was; }
+    } guard;
+    bool ok = true;
     for (const auto& c : cmds) {
         const std::string why = ControlHandler::apply_command(c);
-        if (!why.empty()) std::cerr << "Trunk following: '" << c << "' refused (" << why << ")" << std::endl;
+        if (!why.empty()) {
+            std::cerr << "Trunk following: '" << c << "' refused (" << why << ")" << std::endl;
+            ok = false;
+            if (stop_on_error) break;
+        }
     }
-    g_dispatching = was;
+    return ok;
+}
+
+bool write_enabled(const std::shared_ptr<Inst>& inst, bool enabled) {
+    auto writer = managed_iq::registry().write(inst->serial,inst);
+    if (!writer || inst->being_deleted.load()) return false;
+    inst->enabled = enabled;
+    return true;
 }
 
 void set_heard(int vfo, bool on) {
@@ -932,7 +1402,12 @@ void merge_temp(const std::string from, const std::string to, const std::string 
     for (uint64_t id : gone) {
         auto it2 = g_calls.find(id);
         if (it2 == g_calls.end()) continue;
-        if (Voice* v = voice_of_call(it2->second)) park(*v);
+        if (Voice* v = voice_of_call(it2->second))
+#ifdef TT01_L_BOUNDED_QUALIFICATION
+            {if(!park_checked(*v))continue;}
+#else
+            park(*v);
+#endif
         auto k = g_call_by_key.find(it2->second.key);
         if (k != g_call_by_key.end() && k->second == id) g_call_by_key.erase(k);
         g_calls.erase(it2);
@@ -1096,6 +1571,32 @@ void record_history(const Call& c, const std::string& end) {
 
 void park(Voice& v);
 void end_call(uint64_t id, const std::string& why);
+std::vector<std::weak_ptr<Inst>> pending_handbacks;
+void recover_handbacks() {
+    for(auto it=pending_handbacks.begin();it!=pending_handbacks.end();){
+        auto inst=it->lock();
+        if(!inst||inst->being_deleted.load()||decimator_manager.getDecimator(inst->id)!=inst){
+            it=pending_handbacks.erase(it);continue;
+        }
+        auto authority=managed_iq::registry().state(inst->serial,inst);
+        auto role=authority?authority->capture_role():std::nullopt;
+        if(role&&role->role==managed_iq::Role::manual){
+            it=pending_handbacks.erase(it);continue;
+        }
+        const bool owned=std::any_of(g_voices.begin(),g_voices.end(),
+            [&](const Voice& v){return live(v)==inst;});
+        if(!owned&&role&&role->role==managed_iq::Role::managed&&
+            !inst->enabled.load()&&!inst->audio_out.load()&&
+            inst->digital_mode.load()==static_cast<int>(dig::Mode::OFF)&&
+            inst->demod_mode.load()==DemodulatorMode::NBFM&&
+            authority->hand_back_if_closed(*role)){
+            std::cout<<"Trunk following: delayed hand-back D"<<inst->id
+                     <<" recovered as disabled manual VFO (explicit enable required)"<<std::endl;
+            it=pending_handbacks.erase(it);
+            broadcast(MessageBuilders::build_decimator_info_message());
+        }else ++it;
+    }
+}
 
 // uWS loop: remove a voice VFO (muted first - removing the last VFO heard
 // makes another one heard - then through the manager, not REMOVE_DECIMATOR:
@@ -1103,6 +1604,7 @@ void end_call(uint64_t id, const std::string& why);
 void remove_voice_at(size_t i) {
     if (i >= g_voices.size()) return;
     Voice v = g_voices[i];
+    if (v.publication) v.publication->retire();
     g_voices.erase(g_voices.begin() + static_cast<std::ptrdiff_t>(i));
     if (v.call) {
         auto it = g_calls.find(v.call);
@@ -1117,9 +1619,17 @@ void remove_voice_at(size_t i) {
     } else if (auto inst = live(v)) {
         // the last VFO (the user removed theirs): it can't go - it is the user's
         // now, as a plain VFO: enabled, NBFM, its decoder off, muted, where it was
-        inst->enabled = true;
-        decimator_manager.setDigitalMode(v.vfo, dig::Mode::OFF, "");
-        decimator_manager.setDemodMode(v.vfo, DemodulatorMode::NBFM);
+        write_enabled(inst,false);
+        const bool decoder_off=decimator_manager.setDigitalMode(v.vfo, dig::Mode::OFF, "");
+        const bool plain=decimator_manager.setDemodMode(v.vfo, DemodulatorMode::NBFM);
+        if (!decoder_off||!plain||!managed_iq::registry().hand_back(inst->serial, inst)) {
+            write_enabled(inst,false);
+            pending_handbacks.emplace_back(inst);
+            std::cerr << "Trunk following: last VFO hand-back refused; retained closed D" << v.vfo << std::endl;
+            broadcast(MessageBuilders::build_decimator_info_message());
+            return;
+        }
+        write_enabled(inst,true);
         std::cout << "Trunk following: voice VFO D" << v.vfo << " is the last VFO - handed back as a plain NBFM VFO (decoder off)"
                   << std::endl;
     }
@@ -1133,16 +1643,64 @@ void remove_all_voices() {
 // parked: muted, not decimated (enabled off: its decoder gets no samples and
 // its plugin process idles), kept for the next grant
 void park(Voice& v) {
+    if (v.publication) v.publication->retire();
+#ifdef TT01_LIFECYCLE_QUALIFICATION
+    v.lifecycle={};v.lifecycle_evidence.reset();
+#endif
     if (v.call) v.last_call = v.call;
     v.call = 0;
     v.parked_ms = now_ms();
     if (auto inst = live(v)) {
         set_heard(v.vfo, false);
-        inst->enabled = false;
+        write_enabled(inst, false);
     }
     meta_voice(v);
     g_status_now = true;   // (no decimator_info: a page takes a voice VFO's state from the trunk status' vfos)
 }
+
+#ifdef TT01_L_BOUNDED_QUALIFICATION
+void (*l_retire_hook)(int)=nullptr; // offline test only, outside admission
+bool park_checked(Voice& v){
+    const auto it=g_calls.find(v.call);
+    if(it==g_calls.end()||!it->second.native_control){park(v);return true;}
+    if(!kshadow::in_range(v.vfo))return false;
+    auto& entry=kshadow::dependencies[v.vfo];
+    if(!entry||!entry->voice||entry->voice->expected.id!=v.call||
+       entry->voice_pub!=v.publication)return false;
+    const auto dep=*entry; // retain across hook and exact conditional cleanup
+    auto inst=live(v);
+    if(!inst||inst->serial!=dep.voice->tuple.instance||
+       inst->digital_serial.load()!=dep.voice->tuple.decoder||
+       inst->being_deleted.load())return false;
+    if(l_retire_hook)l_retire_hook(v.vfo);
+    if(live(v)!=inst||v.call!=dep.voice->expected.id||
+       !entry||entry->voice!=dep.voice)return false;
+    const bool closed=dep.voice_pub->close_exact(dep.voice,dep.voice_role,[&]{
+        if(inst->being_deleted.load()||inst->digital_serial.load()!=dep.voice->tuple.decoder)
+            return false;
+        // No setter, mixer or callback under the publication lock. Exact
+        // ownership covers only these instance-local atomic effects.
+#ifdef TT01_D2_MANAGER_QUALIFICATION
+        managed_iq::audio_selection::set(inst->id,inst->serial,inst->audio_out,false);inst->enabled.store(false);
+#else
+        inst->audio_out.store(false);inst->enabled.store(false);
+#endif
+        return !inst->audio_out.load()&&!inst->enabled.load();
+    });
+    if(!closed)return false; // retain occupied assignment, never advertise free
+    if(live(v)!=inst||inst->enabled.load()||inst->audio_out.load()||
+       !dep.voice_pub->role_current(dep.voice_role)||dep.voice_pub->snapshot())return false;
+    audio_mixer.retain(decimator_manager.audioVfoIds());
+    v.lifecycle={};v.lifecycle_evidence.reset();v.active_here=false;
+    v.last_call=v.call;v.call=0;v.parked_ms=now_ms();
+    entry.reset();
+#ifdef TT01_D1_PCM_QUALIFICATION
+    pcm_lane::clear(v.vfo);
+#endif
+    meta_voice(v);g_status_now=true;
+    return true;
+}
+#endif
 
 // A voice VFO for a call: a parked one (the one the call had at its last
 // over first - the same VFO again -, then one already running the call's
@@ -1163,7 +1721,8 @@ Voice* free_voice(const std::string& plugin, uint64_t call, std::string* why) {
         *why = "vfo_limit";
         return nullptr;
     }
-    const int id = decimator_manager.addDecimator();   // muted, at 0 Hz
+    const bool managed_producer = plugin == "p25" && operating_mode_index() == 2 && !playback::active();
+    const int id = decimator_manager.addDecimator(managed_producer);   // muted, at 0 Hz
     auto inst = id >= 0 ? decimator_manager.getDecimator(id) : nullptr;
     if (!inst) {
         *why = "vfo_limit";
@@ -1172,6 +1731,7 @@ Voice* free_voice(const std::string& plugin, uint64_t call, std::string* why) {
     Voice v;
     v.vfo = id;
     v.inst = inst;
+    v.publication = managed_iq::registry().lookup(inst->serial, inst);
     v.parked_ms = now_ms();
     g_voices.push_back(v);
     std::cout << "Trunk following: voice VFO D" << id << " made" << std::endl;
@@ -1182,12 +1742,40 @@ Voice* free_voice(const std::string& plugin, uint64_t call, std::string* why) {
 // decoder gets them before, or with, its first samples on the channel), then
 // the decoder, demod, width, squelch, the frequency
 bool g_on_grant = false;   // apply_event is handling a GRANT (placement latency)
-void apply_voice(Voice& v, Call& c, const Place& p) {
+#ifdef TT01_MANAGER_TRANSACTION_TEST
+TransactionHook transaction_hook = nullptr;
+void (*transaction_commit_test_hook)(int) = nullptr;
+#endif
+
+bool apply_voice(Voice& v, Call& c, const Place& p
+#ifdef TT01_K_PLACEMENT_QUALIFICATION
+                 ,const kshadow::Intent* intent=nullptr
+#endif
+                 ) {
     auto inst = live(v);
-    if (!inst) return;
+    if (!inst) return false;
+#ifdef TT01_K_PLACEMENT_QUALIFICATION
+    if(c.native_control!=bool(intent))return false;
+    if(intent&&(v.call||!kshadow::fresh(*intent)))return false;
+#endif
     const int64_t now = now_ms();
     const std::string sid = std::to_string(v.vfo);
     const bool analog = c.demod == "nfm";
+    const int mode_now = operating_mode_index();
+    const bool managed = mode_now == 2 && !analog && c.decoder == "p25" && !playback::active();
+    // Close the old publication before options or any other mutable command.
+    // Only manager intent is published here; the producer is not wired yet.
+    if (v.publication) v.publication->retire();
+    if (managed) v.publication = managed_iq::registry().claim(inst->serial, inst);
+    const uint64_t ticket = managed && v.publication ? v.publication->begin(p.tuner) : 0;
+    auto reject = [&]() {
+        park(v);
+        v.dirty = true;
+        std::cerr << "Trunk following: managed placement refused for D" << v.vfo << std::endl;
+        return false;
+    };
+    if (managed && !ticket) return reject();
+    managed_iq::PendingPlacement pending(v.publication,ticket);
     dig::PluginInfo pi;
     plugin_info(c.decoder, &pi);
     // the control VFO's Logging / Plot on map / Positions every / Show all messages / Transcribe
@@ -1200,7 +1788,11 @@ void apply_voice(Voice& v, Call& c, const Place& p) {
     o.plugin.clear();
     for (const auto& kv : c.options) o.plugin[c.decoder + "." + kv.first] = kv.second;
     std::vector<std::string> cmds;
-    decimator_manager.setDigitalOptions(v.vfo, o);
+    const bool options_ok = [&] {
+        managed_iq::AuthorizedWrites capability(v.publication.get(),ticket);
+        return decimator_manager.setDigitalOptions(v.vfo, o);
+    }();
+    if (managed && !options_ok) return reject();
     const std::string mode = "PLUGIN:" + c.decoder;
     const bool same_plugin = inst->digital_mode.load() == static_cast<int>(dig::Mode::PLUGIN) && v.plugin == c.decoder;
     if (!same_plugin || v.dirty) cmds.push_back("DIGITAL_MODE:" + sid + ":" + mode);
@@ -1219,7 +1811,6 @@ void apply_voice(Voice& v, Call& c, const Place& p) {
     cmds.push_back("DEC_SQUELCH_ENABLE:" + sid + ":1");
     if (inst->transcribe.load() != transcribe) cmds.push_back("VOICE2TEXT_VFO:" + sid + ":" + (transcribe ? "1" : "0"));
     char f[96];
-    const int mode_now = operating_mode_index();
     if (mode_now == 2) snprintf(f, sizeof f, "SET_DECIMATOR_FREQ:%d:%.3f:%d", v.vfo, p.off_hz / 1000.0, p.tuner);
     else snprintf(f, sizeof f, "SET_DECIMATOR_FREQ:%d:%.3f", v.vfo, p.off_hz / 1000.0);
     cmds.push_back(f);
@@ -1244,14 +1835,85 @@ void apply_voice(Voice& v, Call& c, const Place& p) {
         v.await_reset = delivered && (moved || !same_plugin);
         v.same_place = !moved && same_plugin;
         v.active_here = false;
+#ifdef TT01_LIFECYCLE_QUALIFICATION
+        v.lifecycle={};v.lifecycle_evidence.reset();
+#endif
     }
     // a retune > 100 Hz resets the decoder: that RESET is ours
     v.dec = inst->digital_serial.load();
     g_tracks[v.vfo].expect_reset_until = now + RESET_EXPECT_MS;
     // heard first: a VFO heard first moves the audio channel with it (independent)
+#ifdef TT01_K_PLACEMENT_QUALIFICATION
+    if(intent){
+        if(kshadow::placement_hook)kshadow::placement_hook(1,v.vfo);
+        if(!kshadow::fresh(*intent))return reject();
+    }else
+#endif
     set_heard(v.vfo, g_set.audio);
-    dispatch(cmds);
-    inst->enabled = true;
+#ifdef TT01_MANAGER_TRANSACTION_TEST
+    if (managed && transaction_hook) transaction_hook(v.vfo, false);
+#endif
+    const bool dispatched = [&] {
+        managed_iq::AuthorizedWrites capability(v.publication.get(),ticket);
+        return dispatch(cmds, managed);
+    }();
+#ifdef TT01_MANAGER_TRANSACTION_TEST
+    if (managed && transaction_hook) transaction_hook(v.vfo, true);
+#endif
+    if (managed) {
+        if (!dispatched || live(v) != inst || inst->being_deleted.load() ||
+            operating_mode_index() != 2 || playback::active() ||
+            !std::isfinite(p.centre) || p.centre <= 0 ||
+            p.tuner < 0 || p.tuner >= n_tuners()) return reject();
+        auto dd = inst->getDigital();
+        const uint64_t serial = inst->digital_serial.load();
+        if (!dd || !serial || inst->digital_mode.load() != static_cast<int>(dig::Mode::PLUGIN) ||
+            dd->mode() != dig::Mode::PLUGIN || inst->demod_mode.load() != DemodulatorMode::DIGITAL ||
+            inst->decimator->getBandwidthHz() != bw ||
+            !inst->squelch_enabled.load() ||
+            inst->squelch_method.load() != static_cast<int>(SquelchMethod::DIGITAL) ||
+            inst->transcribe.load() != transcribe) return reject();
+        const auto applied_options = dd->options();
+        // The frequency command is serialized in kHz to 3 decimal places.
+        // Reproduce its float parse exactly, then check its intended RF.
+        char offset_text[48];
+        snprintf(offset_text, sizeof offset_text, "%.3f", p.off_hz / 1000.0);
+        const float expected_offset = std::stof(offset_text) * 1000.0f;
+        if (std::fabs(p.centre + expected_offset - c.hz) > 1.0) return reject();
+        const managed_iq::Tuple expected{inst->serial, serial, 2, p.tuner, bw,
+            static_cast<uint64_t>(std::llround(p.centre)), expected_offset, c.decoder, o.plugin};
+        const int applied_tuner = inst->tuner_channel.load();
+        if (applied_tuner < 0 || applied_tuner >= n_tuners()) return reject();
+        const managed_iq::Tuple applied{inst->serial, inst->digital_serial.load(),
+            operating_mode_index(), applied_tuner, inst->bandwidth_hz.load(),
+            exact_tuner_hz(applied_tuner), inst->frequency_offset_hz.load(),
+            dd->plugin_id(), applied_options.plugin};
+        const managed_iq::Target target{c.sys, c.ch.name, c.ctl_vfo, c.ch.slot, c.group, c.id, c.target};
+        {
+            managed_iq::AuthorizedWrites capability(v.publication.get(),ticket);
+            if (!write_enabled(inst, true)) return reject();
+        }
+#ifdef TT01_MANAGER_TRANSACTION_TEST
+        if (transaction_commit_test_hook) transaction_commit_test_hook(v.vfo);
+#endif
+#ifdef TT01_K_PLACEMENT_QUALIFICATION
+        if(intent){
+            if(kshadow::placement_hook)kshadow::placement_hook(2,v.vfo);
+            if(!kshadow::publish(*intent,v.vfo,v.publication,ticket,expected,applied,target,dispatched,
+                    {indep_tuner_freq_hz[applied_tuner].load(),tuner_frequencies[applied_tuner].load(),false}))
+                return reject();
+        }else
+#endif
+        if (!v.publication->commit(ticket, expected, applied, target,
+                managed_iq::ingress_highwater.load(std::memory_order_acquire), dispatched,
+                {indep_tuner_freq_hz[applied_tuner].load(),tuner_frequencies[applied_tuner].load(),false}))
+            return reject();
+    } else if (v.publication) {
+        // Out-of-scope protocols retain their existing behavior; the old
+        // P25 snapshot is retired before explicit ownership relinquishment.
+        if (!managed_iq::registry().hand_back(inst->serial, inst)) return reject();
+    }
+    if (!managed && !write_enabled(inst, true)) return reject();
     v.dec = inst->digital_serial.load();
     v.plugin = c.decoder;
     v.demod = demod;
@@ -1267,7 +1929,14 @@ void apply_voice(Voice& v, Call& c, const Place& p) {
     v.call = c.id;
     c.vfo = v.vfo;
     c.t_placed = now;
+    c.t_call_active = 0;
+    c.call_report = VoiceCallReport::None;
     c.pending_place = false;
+#ifdef TT01_K_PLACEMENT_QUALIFICATION
+    // Only the newly admitted voice may become heard; no existing call is
+    // replaced or muted. Audio retirement is still a later boundary.
+    if(intent)set_heard(v.vfo,g_set.audio);
+#endif
     meta_voice(v);
     broadcast(MessageBuilders::build_decimator_info_message());
     // (only a placement on the grant's arrival: one that waited - for a free
@@ -1278,6 +1947,7 @@ void apply_voice(Voice& v, Call& c, const Place& p) {
     }
     std::cout << "Trunk following: " << c.sys << " " << (c.group ? "TG " : "unit ") << c.target << " on " << c.ch.name
               << " (" << c.hz / 1e6 << " MHz) -> D" << v.vfo << std::endl;
+    return true;
 }
 
 // ============================================================================
@@ -1344,6 +2014,7 @@ void note_followed(System& s, Call& c) {
 void set_state(Call& c, int st) {
     if (c.st == st) return;
     c.st = st;
+    if (st == ACTIVE) c.tentative = false;
     c.t_state = now_ms();
     if (Voice* v = voice_of_call(c)) meta_voice(*v);
     g_status_now = true;
@@ -1352,7 +2023,12 @@ void set_state(Call& c, int st) {
 // the call loses its voice VFO (parked) and waits (why)
 void unfollow(Call& c, const std::string& why) {
     if (c.vfo >= 0) c.lost = why;
-    if (Voice* v = voice_of_call(c)) park(*v);
+    if (Voice* v = voice_of_call(c))
+#ifdef TT01_L_BOUNDED_QUALIFICATION
+        {if(!park_checked(*v))return;}
+#else
+        park(*v);
+#endif
     c.vfo = -1;
     c.pending_place = false;
     set_state(c, WAIT);
@@ -1386,7 +2062,12 @@ void note_no_signal(System& s, Call& c) {
 void drop_call(uint64_t id) {
     auto it = g_calls.find(id);
     if (it == g_calls.end()) return;
-    if (Voice* v = voice_of_call(it->second)) park(*v);
+    if (Voice* v = voice_of_call(it->second))
+#ifdef TT01_L_BOUNDED_QUALIFICATION
+        {if(!park_checked(*v))return;}
+#else
+        park(*v);
+#endif
     auto k = g_call_by_key.find(it->second.key);
     if (k != g_call_by_key.end() && k->second == id) g_call_by_key.erase(k);
     g_calls.erase(it);
@@ -1403,7 +2084,12 @@ void end_call(uint64_t id, const std::string& why) {
     const bool was_followed = c.vfo >= 0;
     if (was_followed && c.st == SETUP && now_ms() - c.t_placed >= SETUP_GIVEUP_MS)
         if (System* sy = sys_of(c.sys)) note_no_signal(*sy, c);   // (released before SETUP gave up)
-    if (Voice* v = voice_of_call(c)) park(*v);
+    if (Voice* v = voice_of_call(c))
+#ifdef TT01_L_BOUNDED_QUALIFICATION
+        {if(!park_checked(*v))return;}
+#else
+        park(*v);
+#endif
     record_history(c, why);
     c.vfo = -1;
     c.pending_place = false;
@@ -1447,12 +2133,83 @@ uint64_t victim_for(const Call& c) {
     return v;
 }
 
+// In single-voice independent P25 following, an equal-ranked, fresh
+// in-span grant on the same site may use a silent call's VFO once an
+// explicit transmission end and the configured hang have both elapsed.
+// A grant update alone must not reserve that resource against new traffic.
+bool voice_as_set(const Voice& v, const Call& c);
+uint64_t ended_hang_victim(const Call& c) {
+    if (c.tentative || operating_mode_index() != 2 || g_set.max_vfos != 1 ||
+        c.decoder != "p25" || c.demod == "nfm" || c.pending_place)
+        return 0;
+    const int64_t now = now_ms();
+    const int64_t hang = std::llround(g_set.hang_s * 1000);
+    if (now - c.t_grant >= GRANT_FRESH_MS) return 0;
+    for (const auto& kv : g_calls) {
+        const Call& o = kv.second;
+        if (o.id == c.id || o.vfo < 0 || o.st != HANG ||
+            o.sys != c.sys || o.ctl_vfo != c.ctl_vfo ||
+            o.decoder != "p25" || o.demod == "nfm" ||
+            rank(o) != rank(c) || o.pending_place ||
+            o.call_report != VoiceCallReport::Ended ||
+            now - o.t_hang < hang)
+            continue;
+        const Voice* v = voice_of_call(o);
+#ifdef TT01_LIFECYCLE_QUALIFICATION
+        if(v&&v->publication)continue;
+#endif
+        if (!v || v->dirty || v->mode != 2 || !voice_as_set(*v, o) ||
+            std::fabs(tuner_centre(2, v->tuner) - v->centre_hz) > 1000)
+            continue;
+        return o.id;
+    }
+    return 0;
+}
+
+// A revived same-assignment update can probe for late entry, but an
+// unconfirmed probe may yield to an equal-ranked explicit grant. Keep
+// this in the same narrow boundary as contention-aware hang release.
+uint64_t tentative_victim(const Call& c) {
+    if (operating_mode_index() != 2 || g_set.max_vfos != 1 ||
+        c.decoder != "p25" || c.demod == "nfm" || c.tentative || c.pending_place)
+        return 0;
+    const int64_t now = now_ms();
+    if (c.t_initial_rx <= 0 || now - c.t_initial_rx >= GRANT_FRESH_MS) return 0;
+    for (const auto& kv : g_calls) {
+        const Call& o = kv.second;
+        if (o.id == c.id || o.vfo < 0 || o.st != SETUP || !o.tentative ||
+            o.sys != c.sys || o.ctl_vfo != c.ctl_vfo ||
+            o.decoder != "p25" || o.demod == "nfm" || rank(o) != rank(c) ||
+            o.pending_place)
+            continue;
+        const Voice* v = voice_of_call(o);
+#ifdef TT01_LIFECYCLE_QUALIFICATION
+        // No lifecycle-driven tentative preemption until the destructive
+        // manager side-effect boundary is qualified.
+        if(v&&v->publication)continue;
+#endif
+        if (!v || v->active_here || v->dirty || v->mode != 2 || !voice_as_set(*v, o) ||
+            std::fabs(tuner_centre(2, v->tuner) - v->centre_hz) > 1000)
+            continue;
+        auto inst = live(*v);
+        auto dd = inst ? inst->getDigital() : nullptr;
+        const int64_t since = now - o.t_placed - STALE_FRAMES_MS;
+        if (dd && since > 0 && dd->frames_within(std::min<int64_t>(FRAMES_ACTIVE_MS, since)))
+            continue;
+        return o.id;
+    }
+    return 0;
+}
+
 // Follow call c now if it may and can be: "" = followed, else why not
 std::string exc_try(Call& c, double hz, double bw);
 std::string vt_try(Call& c, double hz, double bw);
 bool plugin_trunking(const std::string& id);
 bool exc_in_transit();
 std::string try_follow(Call& c) {
+#ifdef TT01_K_PLACEMENT_QUALIFICATION
+    if(c.native_control)return "fresh_native_grant_required";
+#endif
     System* s = sys_of(c.sys);
     if (!s) return "no_system";
     std::string why = policy_why(*s, c);
@@ -1480,6 +2237,23 @@ std::string try_follow(Call& c) {
                 if (why == "out_of_span") why = vt_try(c, hz, bw);   // (independent: a voice tuner)
             } else {
                 Voice* v = free_voice(c.decoder, c.id, &why);
+                if (!v && why == "no_vfo") {
+                    if (const uint64_t vic = tentative_victim(c)) {
+                        Call& old = g_calls.at(vic);
+                        const int vfo = old.vfo;
+                        unfollow(old, "no_vfo");
+                        v = voice_of_vfo(vfo);
+                        if (v && v->call) v = nullptr;
+                    }
+                }
+                if (!v && why == "no_vfo") {
+                    if (const uint64_t vic = ended_hang_victim(c)) {
+                        const int vfo = g_calls.at(vic).vfo;
+                        end_call(vic, "ended");
+                        v = voice_of_vfo(vfo);
+                        if (v && v->call) v = nullptr;
+                    }
+                }
                 if (!v && rank(c) > 0) {
                     if (const uint64_t vic = victim_for(c)) {
                         auto vi = g_calls.find(vic);
@@ -1492,15 +2266,15 @@ std::string try_follow(Call& c) {
                         if (v && v->call) v = nullptr;
                     }
                 }
-                if (v) {
-                    apply_voice(*v, c, p);
+                if (v && apply_voice(*v, c, p)) {
                     note_followed(*s, c);
                     c.why.clear();
                     set_state(c, SETUP);
                     c.t_activity = now_ms();
                     return "";
                 }
-                if (why.empty()) why = "no_vfo";
+                if (v) why = "place_refused";
+                else if (why.empty()) why = "no_vfo";
             }
         }
     }
@@ -1519,9 +2293,20 @@ std::string try_follow(Call& c) {
 // call c (followed) to its (new) channel: re-placed, or unfollowed when it
 // can't be (rate-limited: a flood of moves re-places at most every PLACE_MIN_MS)
 void replace_call(Call& c) {
+#ifdef TT01_K_PLACEMENT_QUALIFICATION
+    if(c.native_control)return;
+#endif
     Voice* v = voice_of_call(c);
     if (!v) return;
     if (now_ms() - v->t_placed < PLACE_MIN_MS) {
+#ifdef TT01_HANDOVER_TRACE
+        const auto current=v->publication?v->publication->snapshot():nullptr;
+        std::cerr<<"HANDOVER_TRACE throttle call="<<c.id<<" token="<<(current?current->token:0)
+                 <<" age="<<(now_ms()-v->t_placed)<<std::endl;
+#endif
+        // Incompatible grant intent already superseded this placement.
+        // The dispatch throttle delays the new configuration, not retirement.
+        if (v->publication) v->publication->retire();
         c.pending_place = true;
         return;
     }
@@ -1537,7 +2322,7 @@ void replace_call(Call& c) {
     const double bw = std::min(VOICE_BW_MAX_HZ, std::max(c.bw, pi.min_vfo_rate > 0 ? pi.min_vfo_rate : 12500.0));
     const Place p = place_for(hz, bw, v->tuner);
     if (!p.ok) return unfollow(c, "out_of_span");
-    apply_voice(*v, c, p);
+    if (!apply_voice(*v, c, p)) return unfollow(c, "place_refused");
     set_state(c, SETUP);
     c.t_activity = now_ms();
 }
@@ -1553,6 +2338,12 @@ bool voice_as_set(const Voice& v, const Call& c) {
     if (!dd || dd->mode() != dig::Mode::PLUGIN || dd->plugin_id() != c.decoder) return false;
     // the grant's options
     const dig::Options o = dd->options();
+    if (v.mode == 2 && c.decoder == "p25" && c.demod != "nfm" && v.publication) {
+        const auto published = v.publication->snapshot();
+        if (!published || inst->tuner_channel.load() != published->tuple.tuner ||
+            inst->digital_serial.load() != published->tuple.decoder ||
+            o.plugin != published->tuple.options) return false;
+    }
     for (const auto& kv : c.options) {
         auto it = o.plugin.find(c.decoder + "." + kv.first);
         if (it == o.plugin.end() || it->second != kv.second) return false;
@@ -1622,6 +2413,105 @@ Call* new_call(System& s, const std::string& key, const PluginEvent& ev, const s
 }
 
 // a RECENT call's next over: the same call again, waiting to be followed
+#ifdef TT01_K_PLACEMENT_QUALIFICATION
+namespace kshadow {
+void native_grant(int ctl,const p25_control::Proof& proof){
+    // No new unit, unknown service/update, traffic-derived or extended
+    // protocol placement. A repeated grant cannot rekey a live call.
+    if(!proof.grant.group||
+#ifndef TT01_L_BOUNDED_QUALIFICATION
+       proof.grant.update||proof.grant.service<0||
+#endif
+       !g_set.follow||g_paused||searching()||scanning()||playback::active()||
+       operating_mode_index()!=2||now_ms()<g_fence_until||exc_in_transit())return;
+    Intent intent{ctl,origins[ctl],proof};
+    if(!fresh(intent))return;
+    char keybuf[16],nac[8],wacn[8],sid[8];
+    snprintf(keybuf,sizeof keybuf,"%05X.%03X",proof.wacn,proof.sys);
+    snprintf(nac,sizeof nac,"%03X",proof.nac);
+    snprintf(wacn,sizeof wacn,"%05X",proof.wacn);
+    snprintf(sid,sizeof sid,"%03X",proof.sys);
+    const std::string sys=std::string("p25:")+keybuf;
+    const auto target=std::to_string(proof.grant.target);
+    const auto key=call_key(sys,ctl,true,target);
+#ifdef TT01_L_BOUNDED_QUALIFICATION
+    uint64_t recent=0;
+    if(auto k=g_call_by_key.find(key);k!=g_call_by_key.end()){
+        auto old=g_calls.find(k->second);
+        if(old==g_calls.end()||!old->second.native_control)return;
+        auto& c=old->second;
+        if(c.vfo>=0){
+            auto* v=voice_of_call(c);
+            if(!v)return;
+            const auto* d=dependency(v->vfo,v->publication?v->publication->snapshot():nullptr);
+            if(d&&d->proof.origin==proof.origin&&d->proof.revision==proof.revision&&
+               d->proof.down_revision==proof.down_revision&&d->proof.up_revision==proof.up_revision&&
+               d->proof.grant.channel==proof.grant.channel&&d->proof.slot==proof.slot&&
+               d->proof.down==proof.down&&d->proof.up==proof.up&&dependency_current(*d)&&
+               (proof.grant.service<0||bool(proof.grant.service&0x40)==c.enc)){
+                c.t_grant=std::max(c.t_grant,proof.at);
+            }
+            return; // never rekey occupied call or self-grant from voice
+        }
+        if(c.st!=RECENT||proof.at<=c.t_end)return;
+        recent=c.id;
+    }
+    // Update-only can refresh exact occupied assignment, never mint a new one.
+    if(proof.grant.update||proof.grant.service<0)return;
+#else
+    if(g_call_by_key.count(key))return;
+#endif
+    // An existing assignment owns its carrier until the later L effects
+    // boundary. Conservative same-carrier exclusion, including other slot.
+    for(const auto& v:g_voices)
+        if(v.call&&std::fabs(v.rf_hz-double(proof.down))<=1.0)return;
+    if(g_calls.size()>=MAX_CALLS||g_next_call==UINT64_MAX)return;
+    auto* system=sys_of(sys);
+    if(!system){
+        if(g_sys.size()>=MAX_SYSTEMS)return;
+        system=ensure_system(sys,"p25",keybuf);
+    }
+    if(!system)return;
+    PluginEvent ev;ev.kind=PluginEvent::GRANT;ev.group=true;ev.target=target;
+    ev.source=proof.grant.source?std::to_string(proof.grant.source):"";
+    ev.encrypted=(proof.grant.service&0x40)!=0;
+    ev.emergency=(proof.grant.service&0x80)!=0;
+    ev.ch.name=std::to_string(proof.grant.channel>>12)+"-"+std::to_string(proof.grant.channel&4095);
+    ev.ch.number=proof.grant.channel&4095;ev.ch.slot=proof.slot;ev.ch.freq_hz=double(proof.down);
+    ev.ch.uplink_hz=proof.up?double(proof.up):NAN;
+    ev.decoder="p25";ev.bw_hz=12500;
+    ev.options={{"nac",nac},{"wacn",wacn},{"sysid",sid},{"phase",std::to_string(proof.phase)},{"lch",std::to_string(proof.lch)}};
+    Call preview;preview.sys=sys;preview.ctl_vfo=ctl;preview.target=target;preview.group=true;
+    preview.enc=ev.encrypted;preview.decoder="p25";
+    if(!policy_why(*system,preview).empty())return;
+    dig::PluginInfo pi;
+    if(!plugin_info("p25",&pi))return;
+    const double bw=std::min(VOICE_BW_MAX_HZ,std::max(12500.0,pi.min_vfo_rate>0?pi.min_vfo_rate:12500.0));
+    const auto p=place_for(double(proof.down),bw,intent.control.stamp->tuner());
+    double home=0;float gain=0;
+    if(!p.ok||trunk::tuner_home(p.tuner,&home,&gain))return;
+    if(placement_hook)placement_hook(0,-1);
+    if(!fresh(intent))return;
+    // No victim selection, legacy resolver, excursion, retry or replacement.
+    std::string why;
+    auto* v=free_voice("p25",0,&why);
+    if(!v||v->call)return;
+    if(!fresh(intent))return;
+#ifdef TT01_L_BOUNDED_QUALIFICATION
+    if(recent)drop_call(recent); // old call ID is never reused
+#endif
+    auto* c=new_call(*system,key,ev,"p25",ctl);
+    if(!c)return;
+    c->native_control=true;c->source=ev.source;c->enc=ev.encrypted;c->emerg=ev.emergency;
+    c->hz=ev.ch.freq_hz;c->up_hz=ev.ch.uplink_hz;c->fsrc="typed_grant";
+    c->bw=ev.bw_hz;c->options=ev.options;c->t_rx_grant=proof.at;
+    c->t_initial_rx=proof.at;
+    const auto id=c->id;
+    if(!apply_voice(*v,*c,p,&intent)){drop_call(id);return;}
+    note_followed(*system,*c);c->why.clear();set_state(*c,SETUP);c->t_activity=now_ms();
+}
+} // namespace kshadow
+#endif
 void revive(System& s, Call& c, const PluginEvent& ev) {
     c.st = WAIT;
     c.t_state = c.t_start = now_ms();
@@ -1636,7 +2526,10 @@ void revive(System& s, Call& c, const PluginEvent& ev) {
     c.enc = c.emerg = false;
     c.sources.clear();
     c.source.clear();
-    c.t_call_active = c.t_call_ended = 0;
+    c.t_call_active = 0;
+    c.call_report = VoiceCallReport::None;
+    c.tentative = false;
+    c.t_initial_rx = 0;
     count_start(s, c);
     g_status_now = true;
 }
@@ -1752,6 +2645,33 @@ void on_grant(int vfo, Track& t, const std::string& plugin, const PluginEvent& e
         return;
     }
 
+    // Reject trailing updates of an ended call before channel handover:
+    // a rejected grant must not end another call already using this channel.
+    if (c && c->st == RECENT && ev.update && c->guard &&
+        now_ms() - c->t_end < REVIVE_UPDATE_MS && c->ch.name == ev.ch.name &&
+        c->ch.slot == ev.ch.slot)
+        return;
+
+    // Same-assignment update-only revival is ambiguous even after the
+    // trailing-update guard expires. Do not let it displace a protected
+    // owner on that channel; accept explicit grants and changed assignments.
+    const bool tentative_scope = operating_mode_index() == 2 && g_set.max_vfos == 1 &&
+        decoder == "p25" && ev.demod != "nfm";
+    const bool tentative_update = tentative_scope && c && ev.update &&
+        c->ch.name == ev.ch.name && c->ch.slot == ev.ch.slot &&
+        (c->tentative || (c->st == RECENT && c->guard));
+    if (tentative_update) {
+        const auto tg = s.tgs.find(ev.target);
+        const bool priority = ev.group && tg != s.tgs.end() && tg->second.mode == TG_PRIORITY;
+        for (const auto& kv : g_calls) {
+            const Call& o = kv.second;
+            if (o.id != c->id && o.vfo >= 0 && o.sys == s.id && o.ctl_vfo == site &&
+                o.decoder == "p25" && o.demod != "nfm" && o.prio == priority &&
+                !o.tentative && same_channel(o.ch, ev.ch))
+                return;
+        }
+    }
+
     // the channel given to another target on this site: the call that had it
     // is over there - its VFO goes to this one (no retune) when this one may be followed
     int handover = -1;
@@ -1769,11 +2689,6 @@ void on_grant(int vfo, Track& t, const std::string& plugin, const PluginEvent& e
         if (!c) return;
         started = true;
     } else if (c->st == RECENT) {
-        // the next over of the conversation: the same call (the same row) again -
-        // not the repeats of the over just ended (updates within REVIVE_UPDATE_MS)
-        if (ev.update && c->guard && now_ms() - c->t_end < REVIVE_UPDATE_MS && c->ch.name == ev.ch.name &&
-            c->ch.slot == ev.ch.slot)
-            return;
         revive(s, *c, ev);
         started = true;
     } else if (c->ch.name != ev.ch.name || c->ch.slot != ev.ch.slot) {
@@ -1795,6 +2710,12 @@ void on_grant(int vfo, Track& t, const std::string& plugin, const PluginEvent& e
         count_chan(s, ev.ch.name);
         if (cl) cl->grants++;
     }
+    if (started && tentative_update) c->tentative = true;
+    if (!ev.update || moved) {
+        if (c->tentative) c->setup_failed = false;
+        c->tentative = false;
+    }
+    if (!ev.update) c->t_initial_rx = t_rx;
     c->t_grant = now_ms();
     c->t_rx_grant = t_rx;
     update_sources(*c, ev.source, s);
@@ -1858,11 +2779,26 @@ void on_grant(int vfo, Track& t, const std::string& plugin, const PluginEvent& e
                 plugin_info(c->decoder, &pi);
                 const Place p = place_for(hz, std::min(VOICE_BW_MAX_HZ, std::max(c->bw, pi.min_vfo_rate > 0 ? pi.min_vfo_rate : 12500.0)), v->tuner);
                 if (p.ok) {
-                    apply_voice(*v, *c, p);
+                    if (!apply_voice(*v, *c, p)) {
+                        set_why(*c, s, "place_refused");
+                        return;
+                    }
                     note_followed(s, *c);
                     c->why.clear();
                     set_state(*c, SETUP);
                     c->t_activity = now_ms();
+#ifdef TT01_HANDOVER_TRACE
+                    const auto current=v->publication?v->publication->snapshot():nullptr;
+                    std::cerr<<"HANDOVER_TRACE applied call="<<c->id<<" token="<<(current?current->token:0)
+                             <<" opts_changed="<<opts_changed<<" dirty="<<v->dirty<<std::endl;
+#endif
+#ifdef TT01_HANDOVER_QUALIFICATION
+                    // The exact grant's policy, RF and options have already
+                    // been checked and applied by this successful transaction.
+                    // Do not use pre-transaction opts_changed to invalidate
+                    // the just-published assignment in the generic refresh.
+                    return;
+#endif
                 }
             }
         }
@@ -2197,6 +3133,7 @@ void on_voice_call(Voice& v, const PluginEvent& ev) {
             n.why.clear();
             n.t_placed = vv->t_placed;
             n.t_call_active = now;
+            n.call_report = VoiceCallReport::Active;
             n.t_activity = now;
             set_state(n, ACTIVE);
             meta_voice(*vv);
@@ -2207,6 +3144,8 @@ void on_voice_call(Voice& v, const PluginEvent& ev) {
         c.target = ev.target;
         c.group = ev.group;
         c.key = key;
+        // Decoder identity is not an initial grant for this new target.
+        c.t_initial_rx = 0;
         c.sources.clear();
         c.source.clear();
         g_call_by_key[key] = c.id;
@@ -2237,8 +3176,9 @@ void on_voice_call(Voice& v, const PluginEvent& ev) {
     if (ev.call_state == 1) {
         v.active_here = true;
         c.t_call_active = now;
+        c.call_report = VoiceCallReport::Active;
     } else {
-        c.t_call_ended = now;
+        c.call_report = VoiceCallReport::Ended;
     }
 }
 
@@ -2306,6 +3246,33 @@ void apply_event(QEv& q) {
     // this - a removed VFO's id reused - can sit at the same address)
     auto dd = inst->getDigital();
     if (!dd || inst->digital_serial.load() != q.dec) return;
+#ifdef TT01_OPERATIONAL_BUILD
+    // Ordinary callbacks carry their original receiver authority; never
+    // manufacture a legacy grant from a rejected native report.
+    const auto pub=managed_iq::registry().state(inst->serial,inst);
+    if(!q.ordinary_stamp||q.ordinary_stamp->segment()||!q.ordinary_generation||
+       !pub||!managed_iq::manual_output::admit_report(*q.ordinary_stamp,dd.get(),pub,
+              q.ordinary_generation,[]{return true;}))return;
+#endif
+#ifdef TT01_K_PLACEMENT_QUALIFICATION
+    // Native independent P25 must not fall back to the explicitly synthetic
+    // historical event seam. Ordinary non-P25/coherent path stays unchanged.
+    if(q.plugin=="p25"&&operating_mode_index()==2&&!playback::active()){
+        ++g_lifecycle_stats.legacy_refused;return;
+    }
+#endif
+#ifdef TT01_LIFECYCLE_QUALIFICATION
+    if(auto pub=managed_iq::registry().lookup(inst->serial,inst);pub&&pub->role().role!=managed_iq::Role::manual){
+        ++g_lifecycle_stats.legacy_refused;return;
+    }
+#endif
+#ifdef TT01_OPERATIONAL_BUILD
+    {
+        std::lock_guard<std::mutex> lk(g_recent_mu);
+        auto& recent=g_recent[q.vfo];recent.emplace_back(q.plugin,q.ev);
+        while(recent.size()>RECENT_MAX)recent.pop_front();
+    }
+#endif
     if (searching()) {   // (the search owns the receiver: its probes' reports are its own, nothing else counts)
         if (is_probe(q.vfo)) srch_event(q.vfo, q.ev);
         else g_srch_dropped++;
@@ -2365,7 +3332,228 @@ void apply_event(QEv& q) {
 // waits for the next turn (commands, sockets run in between), the queue's bound
 // drops what comes meanwhile
 constexpr size_t DRAIN_MAX = 2000;
+#ifdef TT01_EVENT_AUDIT_QUALIFICATION
+// C1 audit sink on the actual manager loop. Deliberately no on_voice_call,
+// recent-event insertion, grant learning, relabel, state or audio mutation.
+void consume_managed_audit(const std::shared_ptr<const managed_iq::EventBatch>& b){
+    namespace ea=managed_iq::event_audit;
+        if(ea::hook)ea::hook(ea::Stage::before_audit,*b);
+        auto inst=decimator_manager.getDecimator(b->vfo);
+        auto dd=inst?inst->getDigital():nullptr;
+        const auto& p=*b->stamp.provenance.placement;
+        auto* v=voice_of_vfo(b->vfo);
+        auto it=v?g_calls.find(v->call):g_calls.end();
+        const bool selected=inst&&dd&&!inst->being_deleted.load()&&
+            inst->serial==p.tuple.instance&&inst->digital_serial.load()==p.tuple.decoder&&
+            v&&v->inst.lock()==inst&&v->dec==p.tuple.decoder&&it!=g_calls.end()&&
+            it->second.id==p.expected.id&&it->second.vfo==b->vfo&&
+            it->second.sys==p.expected.system&&it->second.ctl_vfo==p.expected.site&&
+            it->second.ch.name==p.expected.channel&&it->second.ch.slot==p.expected.slot&&
+            it->second.group==p.expected.group&&it->second.target==p.expected.target_key;
+#ifdef TT01_LIFECYCLE_QUALIFICATION
+        namespace lc=managed_iq::lifecycle;
+        const bool eligible=selected&&!searching()&&!playback::active()&&now_ms()>=g_fence_until&&
+            !v->dirty&&!it->second.pending_place&&
+            (it->second.st==SETUP||it->second.st==ACTIVE||it->second.st==HANG);
+        if(eligible&&lc::hook)lc::hook(lc::Stage::before_commit,*b);
+        const int64_t received=now_ms();
+        bool changed=false;
+        // Keep prior evidence alive until after admission locks are released.
+        auto previous=eligible?v->lifecycle_evidence:nullptr;
+        const bool matched=eligible&&
+#ifdef TT01_K_TYPED_CONTROL_QUALIFICATION
+        kshadow::voice_admit(b->vfo,b->stamp,dd.get(),[&]{
+#else
+        b->stamp.admit(dd.get(),[&]{
+#endif
+            auto& c=it->second;
+            auto next=v->lifecycle;
+            const bool new_generation=next.token!=p.token||next.generation!=b->stamp.generation;
+            if(!next.begin(b->stamp)){
+                g_lifecycle_stats.refused+=b->calls.size();
+            }else{
+                if(new_generation){
+                    c.call_report=VoiceCallReport::None;c.t_call_active=0;v->active_here=false;
+                    if(c.st==ACTIVE||c.st==HANG){c.st=SETUP;c.t_state=received;changed=true;}
+                }
+                for(const auto& ev:b->calls){
+                    // Encryption policy effects are withheld; a denied report
+                    // cannot mark an otherwise unqualified call ACTIVE.
+                    if(ev.encrypted&&!g_set.enc){++g_lifecycle_stats.refused;continue;}
+                    switch(lc::advance(next.state,ev.call_state)){
+                        case lc::Effect::active:
+                            ++g_lifecycle_stats.active;v->active_here=true;
+                            c.call_report=VoiceCallReport::Active;c.t_call_active=received;c.t_activity=received;
+                            if(c.st!=ACTIVE){c.st=ACTIVE;c.t_state=received;c.tentative=false;changed=true;}
+                            break;
+                        case lc::Effect::ended:
+                        case lc::Effect::released:
+                            if(next.state==lc::State::released)++g_lifecycle_stats.released;
+                            else ++g_lifecycle_stats.ended;
+                            c.call_report=VoiceCallReport::Ended;
+                            if(c.st!=HANG){c.st=HANG;c.t_state=received;c.t_hang=received;changed=true;}
+                            break;
+                        case lc::Effect::refused:++g_lifecycle_stats.refused;break;
+                    }
+                }
+                v->lifecycle=next;v->lifecycle_evidence=b;
+            }
+            std::lock_guard lock(g_qmu);g_event_audit_stats.matched+=b->calls.size();return true;
+        });
+        if(matched&&changed){meta_voice(*v);g_status_now=true;}
+        if(matched&&lc::hook)lc::hook(lc::Stage::committed,*b);
+#ifdef TT01_L_BOUNDED_QUALIFICATION
+        // Reacquire manager selection after hook, never act on old pointer.
+        if(matched){
+            auto* chosen=voice_of_vfo(b->vfo);
+            auto ci=g_calls.find(p.expected.id);
+            if(chosen&&ci!=g_calls.end()&&ci->second.native_control&&
+               chosen->call==ci->first&&chosen->lifecycle_evidence==b&&
+               chosen->lifecycle.state==lc::State::released)
+                end_call(ci->first,"released");
+        }
+#endif
+#else
+        const bool matched=selected&&b->stamp.admit(dd.get(),[&]{
+            std::lock_guard lock(g_qmu);g_event_audit_stats.matched+=b->calls.size();return true;
+        });
+#endif
+        if(!matched){std::lock_guard lock(g_qmu);g_event_audit_stats.stale+=b->calls.size();}
+        if(ea::hook)ea::hook(matched?ea::Stage::matched:ea::Stage::stale,*b);
+}
+#ifdef TT01_D1_PCM_QUALIFICATION
+namespace pcm_lane {
+template<class B,class F>bool admit(const B& b,F&& action){
+    auto inst=decimator_manager.getDecimator(b.vfo);
+    auto dd=inst?inst->getDigital():nullptr;
+    auto* v=voice_of_vfo(b.vfo);
+    const auto& p=b.stamp.provenance.placement;
+    auto it=v?g_calls.find(v->call):g_calls.end();
+    if(!p||!v||!inst||!dd||v->inst.lock()!=inst||inst->serial!=p->tuple.instance||
+       inst->digital_serial.load()!=p->tuple.decoder||v->dirty||it==g_calls.end()||
+       !it->second.native_control||it->second.id!=p->expected.id||it->second.pending_place||
+       (it->second.st!=ACTIVE&&it->second.st!=HANG)||!kshadow::dependency(b.vfo,p)||
+       searching()||playback::active()||now_ms()<g_fence_until)return false;
+    return kshadow::voice_admit(b.vfo,b.stamp,dd.get(),[&]{
+#ifdef TT01_D2_MANAGER_QUALIFICATION
+        if(!b.selection||b.selection!=managed_iq::audio_selection::capture(inst->id,inst->serial))return false;
+#ifdef TT01_D2_PUBLISH_QUALIFICATION
+        if(!b.audio_stream||b.audio_stream==UINT64_MAX||b.audio_stream!=managed_iq::audio_fence::stream_id())return false;
+#endif
+
+#endif
+        return inst->enabled.load()&&inst->audio_out.load()&&!inst->being_deleted.load()&&action();
+    });
+}
+void consume(const std::shared_ptr<const pc::Batch>& b){
+    if(!b||!kshadow::in_range(b->vfo))return;
+    if(pc::hook)pc::hook(pc::Stage::before_admit,*b);
+    auto& buf=buffers[b->vfo];
+    const bool ok=admit(*b,[&]{
+#ifdef TT01_D2_MANAGER_QUALIFICATION
+        const pc::DeliveryKey key{b->stamp.provenance.placement,b->stamp.generation,b->stamp.segment,b->selection
+#ifdef TT01_D2_PUBLISH_QUALIFICATION
+        ,b->audio_stream
+#endif
+        };
+        if(!buf.key||*buf.key!=key){
+            buf.delivery.activate(key);buf.key=key;
+        }
+        const auto before=buf.delivery.pending();
+        if(!buf.delivery.push(key,b->stamp.sync,b->acknowledged_ms,now_ms(),b))return false;
+        if(buf.delivery.pending()<before+b->samples.size())++buf.counts.trimmed;
+        ++buf.counts.accepted;return true;
+#else
+        if(!buf.batches.empty()){
+            const auto& last=buf.batches.back()->stamp;
+            if(last.provenance.placement!=b->stamp.provenance.placement||
+               last.generation!=b->stamp.generation||last.segment!=b->stamp.segment){
+                buf.batches.clear();buf.samples=0;
+            }else if(last.sync>=b->stamp.sync)return false;
+        }
+        while(!buf.batches.empty()&&buf.samples+b->samples.size()>pc::buffer_cap){
+            buf.samples-=buf.batches.front()->samples.size();buf.batches.pop_front();++buf.counts.trimmed;
+        }
+        buf.batches.push_back(b);buf.samples+=b->samples.size();++buf.counts.accepted;
+        return true;
+#endif
+    });
+    if(!ok)++buf.counts.refused;
+    if(pc::hook)pc::hook(ok?pc::Stage::admitted:pc::Stage::refused,*b);
+}
+}
+#endif
+#ifndef TT01_K_SHADOW_QUALIFICATION
+void drain_managed_audit(){
+    std::deque<std::shared_ptr<const managed_iq::EventBatch>> q;
+    {std::lock_guard lock(g_qmu);q.swap(g_event_audit);}
+    for(auto& b:q)consume_managed_audit(b);
+}
+#endif
+#endif
+#ifdef TT01_K_SHADOW_QUALIFICATION
+// Single manager owner. Pick the oldest successfully queued item across
+// lane heads under g_qmu; release it before any authority admission or hooks.
+using OrderedItem=std::variant<std::monostate,QEv,
+    NativeIngress<ManualItem>,
+    NativeIngress<VoiceItem>>;
+OrderedItem take_ordered(){
+    std::lock_guard lock(g_qmu);
+    const auto legacy=g_queue.empty()?NO_INGRESS:g_queue.front().order;
+    const auto manual=g_manual_output.empty()?NO_INGRESS:g_manual_output.front().order;
+    const auto voice=g_event_audit.empty()?NO_INGRESS:g_event_audit.front().order;
+    const auto oldest=std::min({legacy,manual,voice});
+    if(oldest==NO_INGRESS)return {};
+    if(oldest==legacy){auto e=std::move(g_queue.front());g_queue.pop_front();return e;}
+    if(oldest==manual){auto e=std::move(g_manual_output.front());g_manual_output.pop_front();return e;}
+    auto e=std::move(g_event_audit.front());g_event_audit.pop_front();return e;
+}
+void drain_ordered(){
+    for(size_t i=0;i<DRAIN_MAX;++i){
+        auto item=take_ordered();
+        if(std::holds_alternative<std::monostate>(item))break;
+        if(auto* e=std::get_if<QEv>(&item)){
+            const auto now=now_ms();
+            if(now<g_fence_until||(e->ev.kind==PluginEvent::GRANT&&sweep_fenced(now)))continue;
+            try{apply_event(*e);}catch(const std::exception& ex){
+                std::cerr<<"Trunk following: event dropped ("<<ex.what()<<")"<<std::endl;
+            }
+        }else if(auto* e=std::get_if<NativeIngress<ManualItem>>(&item)){
+#ifdef TT01_K_TYPED_CONTROL_QUALIFICATION
+            if(auto* report=std::get_if<managed_iq::manual_output::Report>(&e->value))
+                consume_manual_output(*report);
+            else kshadow::consume_typed(std::get<TypedReport>(e->value));
+#else
+            consume_manual_output(e->value);
+#endif
+        }else{
+            auto& voice_item=std::get<NativeIngress<VoiceItem>>(item).value;
+#ifdef TT01_D1_PCM_QUALIFICATION
+            if(auto* b=std::get_if<std::shared_ptr<const managed_iq::EventBatch>>(&voice_item))consume_managed_audit(*b);
+            else pcm_lane::consume(std::get<std::shared_ptr<const managed_iq::pcm::Batch>>(voice_item));
+#else
+            consume_managed_audit(voice_item);
+#endif
+        }
+    }
+    bool more;
+    {std::lock_guard lock(g_qmu);
+        more=!g_queue.empty()||!g_manual_output.empty()||!g_event_audit.empty();
+        g_drain_posted=more;
+    }
+    if(more&&loop)loop->defer([]{drain_ordered();});
+}
+#endif
 void drain() {
+#ifdef TT01_K_SHADOW_QUALIFICATION
+    drain_ordered();
+#else
+#ifdef TT01_MANUAL_OUTPUT_QUALIFICATION
+    drain_manual_output();
+#endif
+#if defined(TT01_EVENT_AUDIT_QUALIFICATION) && !defined(TT01_LIFECYCLE_QUALIFICATION)
+    drain_managed_audit();
+#endif
     std::deque<QEv> q;
     bool more = false;
     {
@@ -2394,6 +3582,12 @@ void drain() {
             std::cerr << "Trunk following: event dropped (" << ex.what() << ")" << std::endl;
         }
     }
+#ifdef TT01_LIFECYCLE_QUALIFICATION
+    // Retire placements on already-drained control events first. Do not
+    // leapfrog a known ordinary backlog. Cross-queue total order is C2B.
+    if(!more)drain_managed_audit();
+#endif
+#endif
 }
 
 // ============================================================================
@@ -3151,7 +4345,7 @@ void exc_retune(double c, bool home, bool cal, bool hold) {
     for (auto& e : g_exc.ctl) {
         auto inst = exc_inst(e);
         if (!inst) continue;
-        inst->enabled = home || !e.parked;   // a parked control VFO hears nothing (no bogus SYSTEM / grants)
+        write_enabled(inst, home || !e.parked);   // a parked control VFO hears nothing (no bogus SYSTEM / grants)
         if (home) e.parked = false;
     }
     if (!g_exc.kerberos && cal) {
@@ -3198,7 +4392,7 @@ void exc_return(const std::string& why, bool retune) {
             char m[80];
             snprintf(m, sizeof m, "SET_DECIMATOR_FREQ:%d:%.3f", e.vfo, e.off / 1000.0);
             if (!playback::active() && !vfo_held(*inst)) cmds.push_back(m);
-            inst->enabled = true;
+            write_enabled(inst, true);
             e.parked = false;
         }
         exc_expect_resets(10000);
@@ -3423,6 +4617,7 @@ void vt_restore(int t, const std::string& why, bool retune) {
         std::cout << "Trunk following: voice tuner " << t << " back to " << v.home_hz / 1e6 << " MHz (" << why << ")" << std::endl;
     } else if (v.home_hz > 0) {
         // (no command now - a mode change / playback: the remembered tuning is the user's, replayed at the next switch)
+        managed_iq::DomainWrite domain(t);
         indep_tuner_freq_hz[t] = v.home_hz;
         indep_tuner_gain_db[t] = v.home_gain;
     }
@@ -3978,7 +5173,7 @@ void srch_remove_probes() {
         if (!inst || inst->serial != p.serial) continue;
         meta_erase(p.vfo, true);
         if (!decimator_manager.removeDecimator(p.vfo)) {
-            inst->enabled = true;   // (the receiver's last VFO: a plain one, as a voice VFO's hand-back)
+            write_enabled(inst, true);   // (the receiver's last VFO: a plain one, as a voice VFO's hand-back)
             decimator_manager.setDigitalMode(p.vfo, dig::Mode::OFF, "");
         }
         any = true;
@@ -4021,11 +5216,12 @@ void srch_end(const std::string& why, bool home) {
     // sweep mode reported by heimdall (no command: FREQ: / TUNER_FREQ: are refused there now): the state ASKED
     // for goes home all the same - leaving sweep mode sends heimdall back to it, not to a step
     if (home && !playback::active() && operating_mode_index() == 3 && g_srch.home > 0) {
+        managed_iq::DomainWrite domain(g_srch.mode == 2 ? g_srch.tuner : -1);
         if (g_srch.mode == 2) indep_tuner_freq_hz[g_srch.tuner] = g_srch.home;
         else requested_freq_hz.store(static_cast<uint64_t>(std::llround(g_srch.home)), std::memory_order_relaxed);
     }
     for (auto& e : g_srch.ctl)
-        if (auto inst = exc_inst(e)) inst->enabled = true;
+        if (auto inst = exc_inst(e)) write_enabled(inst, true);
     for (auto& e : g_srch.ctl) g_tracks[e.vfo].expect_reset_until = now + 10000;
     if (!cmds.empty()) dispatch(cmds);
     if (g_srch.mode == 0 && !g_srch.kerberos && !playback::active()) heimdall_hold(0);   // (the calibration at home at once)
@@ -4112,7 +5308,7 @@ std::string srch_start(const geo::Json& j) {
     s.kerberos = server_kerberos_mode.load();
     s.ctl = exc_note_ctl();
     for (auto& e : s.ctl)
-        if (auto inst = exc_inst(e)) inst->enabled = false;   // (the user's control VFOs hear nothing while it sweeps)
+        if (auto inst = exc_inst(e)) write_enabled(inst, false);   // (the user's control VFOs hear nothing while it sweeps)
     g_srch = s;
     srch_recs_clear();
     std::cout << "Trunk following: control channel search, " << g_srch.centres.size() << " steps, " << total / 1e6 << " MHz"
@@ -4279,7 +5475,7 @@ void srch_probe_batch() {
             dispatch({"SET_DECIMATOR_BW_HZ:" + std::to_string(id) + ":" + std::to_string(bw), f,
                       "DIGITAL_MODE:" + std::to_string(id) + ":PLUGIN:" + plugin});
             set_heard(id, false);
-            inst->enabled = true;   // (addDecimator makes it disabled)
+            write_enabled(inst, true);   // (addDecimator makes it disabled)
             g_srch.probed++;
             made++;
         }
@@ -4821,7 +6017,7 @@ std::string cc_follow(uint64_t id, bool add) {
     for (const auto& k : bad_opts) e.opts.erase(k);
     auto inst = decimator_manager.getDecimator(vfo);
     if (inst && !inst->enabled.load()) {
-        inst->enabled = true;   // (parked by an excursion / disabled by a search: the click's placement wins)
+        write_enabled(inst, true);   // (parked by an excursion / disabled by a search: the click's placement wins)
         broadcast(MessageBuilders::build_decimator_info_message());
     }
     if (inst) g_cc_follow[vfo] = {inst->serial, e.id};
@@ -4987,7 +6183,11 @@ void tick_exc() {
         Call& c = kv.second;
         if (c.vfo < 0 || c.st == RECENT) continue;
         busy = true;
-        if (calibrating && c.st == SETUP) c.t_placed = now;
+        if (calibrating && c.st == SETUP) {
+            c.t_placed = now;
+            c.t_call_active = 0;
+            c.call_report = VoiceCallReport::None;
+        }
         if (c.id == g_exc.call && g_exc_stats.first_frames_ms < 0 && c.st == ACTIVE) g_exc_stats.first_frames_ms = now - g_exc.t_left;
     }
     if (g_set.retune_max_s > 0 && now - g_exc.t_left > static_cast<int64_t>(g_set.retune_max_s * 1000)) return exc_return("limit", true);
@@ -5079,6 +6279,7 @@ void tick_calls() {
             if (v) {
                 for (size_t i = 0; i < g_voices.size(); i++)
                     if (&g_voices[i] == v) {
+                        if (v->publication) v->publication->retire();
                         meta_erase(v->vfo, true);
                         g_voices.erase(g_voices.begin() + static_cast<std::ptrdiff_t>(i));
                         break;
@@ -5090,6 +6291,40 @@ void tick_calls() {
             set_why(c, *s, "stopped");
             continue;
         }
+#ifdef TT01_L_BOUNDED_QUALIFICATION
+        if(c.native_control){
+            namespace lc=managed_iq::lifecycle;
+            const auto& dep=kshadow::dependencies[v->vfo];
+            const auto reason=policy_why(*s,c);
+            if(!reason.empty()){over.push_back({c.id,reason});continue;}
+            if(!dep||dep->voice->expected.id!=c.id||!kshadow::dependency_current(*dep)){
+                over.push_back({c.id,"control_or_placement_lost"});continue;
+            }
+            if(!voice_as_set(*v,c)){over.push_back({c.id,"placement_changed"});continue;}
+            const auto evidence=v->lifecycle_evidence;
+            auto dd=inst->getDigital();
+            if(evidence&&!kshadow::voice_admit(v->vfo,evidence->stamp,dd.get(),[]{return true;})){
+                ++g_lifecycle_stats.invalidated;
+                over.push_back({c.id,"voice_generation_lost"});continue;
+            }
+            if(v->lifecycle.state==lc::State::released){
+                over.push_back({c.id,"released"});continue;
+            }
+            if(c.st==SETUP&&now-c.t_placed>=SETUP_GIVEUP_MS&&
+               (now-c.t_grant>=1000||now-c.t_placed>=SETUP_MAX_MS)){
+                over.push_back({c.id,"no_signal"});continue;
+            }
+            if(c.st==ACTIVE&&now-c.t_call_active>=CALL_ACTIVE_MS){
+                c.t_hang=now;set_state(c,HANG);
+            }
+            if(c.st==HANG&&now-c.t_hang>=hang){
+                const bool explicit_end=v->lifecycle.state==lc::State::ended;
+                const bool kept=!explicit_end&&now-c.t_grant<GRANT_FRESH_MS&&now-c.t_activity<MAX_SILENT_MS;
+                if(!kept)over.push_back({c.id,"ended"});
+            }
+            continue;
+        }
+#endif
         if (c.pending_place && now - v->t_placed >= PLACE_MIN_MS) {
             replace_call(c);
             if (c.vfo < 0) continue;
@@ -5102,12 +6337,55 @@ void tick_calls() {
             continue;
         }
         // the user changed it: taken back at the next grant
-        if (!v->dirty && !voice_as_set(*v, c)) v->dirty = true;
+        if (!v->dirty && !voice_as_set(*v, c)) {
+            v->dirty = true;
+            if (v->publication) v->publication->retire();
+        }
         auto dd = inst->getDigital();
+#ifdef TT01_LIFECYCLE_QUALIFICATION
+        if(v->publication&&v->mode==2&&c.decoder=="p25"&&c.demod!="nfm"){
+            bool changed=false;
+            const auto evidence=v->lifecycle_evidence;
+            const bool current=evidence&&!v->dirty&&!c.pending_place&&
+                evidence->stamp.provenance.placement->expected.id==c.id&&
+                evidence->stamp.provenance.placement->expected.target_key==c.target&&
+                evidence->stamp.provenance.placement->expected.group==c.group&&
+#ifdef TT01_K_TYPED_CONTROL_QUALIFICATION
+                kshadow::voice_admit(v->vfo,evidence->stamp,dd.get(),[&]{
+#else
+                evidence->stamp.admit(dd.get(),[&]{
+#endif
+                    if(c.st==ACTIVE&&now-c.t_call_active>=CALL_ACTIVE_MS){
+                        c.st=HANG;c.t_state=now;c.t_hang=now;changed=true;
+                    }
+                    return true;
+                });
+            if(evidence&&!current){
+                ++g_lifecycle_stats.invalidated;
+                v->lifecycle={};v->lifecycle_evidence.reset();v->active_here=false;
+                c.call_report=VoiceCallReport::None;c.t_call_active=0;
+                if(c.st==ACTIVE||c.st==HANG){c.st=SETUP;c.t_state=now;changed=true;}
+            }
+            if(changed){meta_voice(*v);g_status_now=true;}
+            // Existing no-signal timeout remains. RELEASED / ENDED do not
+            // drive park/end_call here; C2B must bind those side effects.
+            if(
+#ifdef TT01_K_PLACEMENT_QUALIFICATION
+               !c.native_control&&
+#endif
+               c.st==SETUP&&now-c.t_placed>SETUP_GIVEUP_MS&&
+               (now-c.t_grant>1000||now-c.t_placed>SETUP_MAX_MS)){
+                note_no_signal(*s,c);unfollow(c,"no_signal");
+            }
+            continue;
+        }
+#endif
         const int64_t since = now - c.t_placed - STALE_FRAMES_MS;
         const bool frames = dd && since > 0 && dd->frames_within(std::min<int64_t>(FRAMES_ACTIVE_MS, since));
-        const bool called = c.t_call_active > c.t_call_ended && now - c.t_call_active < CALL_ACTIVE_MS &&
-                            c.t_call_active > c.t_placed;
+        // Reports are consumed in order on the loop; their millisecond ages
+        // cannot order ACTIVE/ENDED or distinguish an immediate new placement.
+        const bool ended = c.call_report == VoiceCallReport::Ended;
+        const bool called = c.call_report == VoiceCallReport::Active && now - c.t_call_active < CALL_ACTIVE_MS;
         const bool analog = c.demod == "nfm" && inst->squelch_open.load() && now - c.t_placed > 300;
         const bool act = frames || called || analog;
         if (act) c.t_activity = now;
@@ -5128,13 +6406,13 @@ void tick_calls() {
                 }
                 break;
             case ACTIVE:
-                if (!act || c.t_call_ended > c.t_call_active) {
+                if (!act || ended) {
                     set_state(c, HANG);
                     c.t_hang = now;
                 }
                 break;
             case HANG:
-                if (act && !(c.t_call_ended > c.t_call_active)) {
+                if (act && !ended) {
                     set_state(c, ACTIVE);
                 } else if (now - c.t_hang >= hang) {
                     // grant updates keep it through a pause, but not past MAX_SILENT_MS of silence
@@ -5156,6 +6434,7 @@ void tick_voices() {
         Voice& v = g_voices[i];
         if (!live(v)) {
             if (!v.call) {
+                if (v.publication) v.publication->retire();
                 meta_erase(v.vfo, true);
                 g_voices.erase(g_voices.begin() + static_cast<std::ptrdiff_t>(i));
             }
@@ -5182,6 +6461,9 @@ void tick_voices() {
         Call& c = g_calls[vic];
         const int vfo = c.vfo;
         unfollow(c, "no_vfo");
+#ifdef TT01_L_BOUNDED_QUALIFICATION
+        if(c.native_control&&c.vfo>=0)break;
+#endif
         for (size_t i = 0; i < g_voices.size(); i++)
             if (g_voices[i].vfo == vfo) {
                 remove_voice_at(i);
@@ -5312,6 +6594,83 @@ void release_everything(const std::string& why) {
 // ============================================================================
 
 void on_plugin_event(int vfo, uint64_t decoder, const std::string& plugin_id, PluginEvent&& ev) {
+#ifdef TT01_MANUAL_OUTPUT_QUALIFICATION
+    namespace mo=managed_iq::manual_output;
+    const auto ctx=mo::context;
+    if(!ctx.stamp||ctx.closing){
+        mo::count_quarantined(ctx.closing);
+        return;
+    }
+#ifdef TT01_OPERATIONAL_BUILD
+    if(!ctx.stamp->segment()){
+        bool post=false;
+        const bool accepted=decoder&&ctx.generation&&vfo==ctx.stamp->decoder_identity()->vfo()&&
+            mo::admit_report(*ctx.stamp,ctx.stamp->decoder_identity(),ctx.stamp->authority(),ctx.generation,[&]{
+                std::lock_guard lock(g_qmu);
+                static const size_t qmax=QUEUE_MAX;
+                if(g_ingress_next==NO_INGRESS||g_queue.size()>=qmax+VFO_LIMIT){
+                    g_events_dropped.fetch_add(1,std::memory_order_relaxed);return false;
+                }
+                if(g_queue.size()>=qmax){
+                    bool pending=false;
+                    if(ev.kind==PluginEvent::RESET)
+                        for(auto it=g_queue.rbegin();it!=g_queue.rend();++it)
+                            if(it->vfo==vfo&&it->dec==decoder){pending=it->ev.kind==PluginEvent::RESET;break;}
+                    if(ev.kind!=PluginEvent::RESET||pending){
+                        (ev.kind==PluginEvent::RESET?g_resets_coalesced:g_events_dropped).fetch_add(1,std::memory_order_relaxed);
+                        return false;
+                    }
+                }
+                g_queue.push_back(QEv{vfo,decoder,plugin_id,std::move(ev),now_ms(),g_ingress_next++,ctx.stamp,ctx.generation});
+                if(!g_drain_posted){g_drain_posted=true;post=true;}
+                return true;
+            });
+        if(accepted)g_events_in.fetch_add(1,std::memory_order_relaxed);
+        if(post&&loop)loop->defer([]{drain();});
+        return;
+    }
+#endif
+    mo::Report report{vfo,decoder,plugin_id,std::move(ev),ctx.stamp,ctx.generation};
+    if(mo::hook)mo::hook(mo::Stage::before_enqueue,report);
+    // Do not take manager locks in the worker callback. The actual wired
+    // handler carries its serial; exact live binding is checked on drain.
+    bool overflow=false;
+    bool accepted=decoder&&vfo==ctx.stamp->decoder_identity()->vfo()&&
+        mo::admit_report(*ctx.stamp,ctx.stamp->decoder_identity(),ctx.stamp->authority(),ctx.generation,[&]{
+            std::lock_guard lock(g_qmu);
+            if(g_manual_output.size()>=mo::cap
+#ifdef TT01_K_SHADOW_QUALIFICATION
+                ||g_ingress_next==NO_INGRESS
+#endif
+            ){
+                overflow=true;++g_manual_output_stats.overflow;
+#ifdef TT01_MANUAL_LOSS_QUALIFICATION
+                // Under publication->generation->queue. Invalidate the
+                // entire source runner before returning the lost report.
+                ctx.stamp->authority()->lose_manual_locked();
+#endif
+                return false;
+            }
+#ifdef TT01_K_SHADOW_QUALIFICATION
+            g_manual_output.push_back({g_ingress_next,std::move(report)});++g_ingress_next;
+#else
+            g_manual_output.push_back(std::move(report));
+#endif
+            ++g_manual_output_stats.accepted;return true;
+        });
+    {std::lock_guard lock(g_qmu);++g_manual_output_stats.received;
+        if(!accepted&&!overflow)++g_manual_output_stats.refused;}
+    // C2B1 audit only: no recent events, normal QEv, or side effects.
+    // Actual loop tick drains this bounded queue; no new defer policy.
+    return;
+#endif
+#if defined(TT01_INTEGRATED_TEST_SEAM) && defined(TT01_MANUAL_OUTPUT_QUALIFICATION)
+}
+// Explicit offline fixture entry. Never called by the actual decoder
+// handler; untagged native callbacks still return above.
+void qualification_inject_event(int vfo, uint64_t decoder, const std::string& plugin_id, PluginEvent&& ev) {
+#endif
+#if !defined(TT01_MANUAL_OUTPUT_QUALIFICATION) || defined(TT01_INTEGRATED_TEST_SEAM)
     {
         std::lock_guard<std::mutex> lk(g_recent_mu);
         auto& q = g_recent[vfo];
@@ -5345,7 +6704,17 @@ void on_plugin_event(int vfo, uint64_t decoder, const std::string& plugin_id, Pl
                 return;
             }
         }
+#ifdef TT01_K_SHADOW_QUALIFICATION
+        // This lane is the explicit fixture seam in the K build, never native
+        // authority. Keep the ordinary RESET reserve policy outside K.
+        if(g_ingress_next==NO_INGRESS||g_queue.size()>=qmax+VFO_LIMIT){
+            g_events_dropped.fetch_add(1,std::memory_order_relaxed);return;
+        }
+        g_queue.push_back(QEv{vfo, decoder, plugin_id, std::move(ev), now_ms(),g_ingress_next});
+        ++g_ingress_next;
+#else
         g_queue.push_back(QEv{vfo, decoder, plugin_id, std::move(ev), now_ms()});
+#endif
         if (!g_drain_posted) {
             g_drain_posted = true;
             post = true;
@@ -5353,6 +6722,7 @@ void on_plugin_event(int vfo, uint64_t decoder, const std::string& plugin_id, Pl
     }
     // on the loop at once: a call's first frames follow its grant by 100-300 ms
     if (post && loop) loop->defer([] { drain(); });
+#endif // legacy event input or explicit offline fixture lane
 }
 
 std::vector<std::pair<std::string, PluginEvent>> recent_events(int vfo) {
@@ -5367,6 +6737,27 @@ void clear_recent() {
     g_recent.clear();
 }
 
+#ifdef TT01_K_SHADOW_QUALIFICATION
+// Offline manager-thread observation only. No mutating test entry.
+uint64_t qualification_k_shadow_current(int vfo){return kshadow::current(vfo);}
+#ifdef TT01_K_TYPED_CONTROL_QUALIFICATION
+p25_control::Catalog qualification_k_typed_catalog(int vfo){return kshadow::catalog(vfo);}
+#ifdef TT01_INTEGRATED_TEST_SEAM
+bool qualification_k_bind_dependency(int ctl,int vfo){return kshadow::bind(ctl,vfo);}
+#ifdef TT01_K_PLACEMENT_QUALIFICATION
+void qualification_k_placement_hook(void (*hook)(int,int)){kshadow::placement_hook=hook;}
+#ifdef TT01_L_BOUNDED_QUALIFICATION
+void qualification_l_retire_hook(void (*hook)(int)){l_retire_hook=hook;}
+#endif
+#endif
+#endif // TT01_INTEGRATED_TEST_SEAM
+bool qualification_k_dependency_current(int vfo){
+    auto p=managed_placement(vfo);
+    const auto* d=kshadow::dependency(vfo,p);
+    return d&&kshadow::dependency_current(*d);
+}
+#endif
+#endif
 bool dispatching() { return g_dispatching; }
 
 bool is_trunk_vfo(int id) {
@@ -5405,6 +6796,7 @@ void release_all_vfos(const std::string& why) {
 void tick() {
     try {
         drain();
+        recover_handbacks();
         // a playback: its systems are a sandbox - put back as they were at its end
         const bool pb = playback::active();
         if (pb != g_pb) {
@@ -6134,9 +7526,198 @@ void note_packet() { g_packet_ms.store(now_ms(), std::memory_order_relaxed); }
 
 void cc_load_public() { cc_load(); }
 
+managed_iq::Snapshot managed_placement(int vfo) {
+    auto inst = decimator_manager.getDecimator(vfo);
+    if (!inst || inst->being_deleted.load()) return {};
+    auto publication = managed_iq::registry().lookup(inst->serial, inst);
+    return publication ? publication->snapshot() : managed_iq::Snapshot{};
+}
+#ifdef TT01_MANAGER_TRANSACTION_TEST
+void set_transaction_test_hook(TransactionHook hook) { transaction_hook = hook; }
+void set_commit_test_hook(void (*hook)(int)) { transaction_commit_test_hook = hook; }
+#endif
+
 const char* before_command(std::string_view m) {
     if (m.starts_with("TRUNK_") || m.starts_with("GET_")) return nullptr;
+    if (!g_dispatching) {
+        // Retire before outside loop commands mutate the applied tuple.
+        // Direct setters, stream epoch and the producer registry are a later
+        // integration boundary; this hook is not a complete writer fence.
+        for (const char* prefix : {"SET_DECIMATOR_FREQ:", "SET_DECIMATOR_BW:",
+                "SET_DECIMATOR_BW_HZ:", "SET_DECIMATOR_DEMOD:", "DIGITAL_MODE:",
+                "DIGITAL_OPT:", "REMOVE_DECIMATOR:", "DEC_SQUELCH_METHOD:",
+                "DEC_SQUELCH_ENABLE:", "VOICE2TEXT_VFO:"}) {
+            if (!m.starts_with(prefix)) continue;
+            auto rest = m.substr(std::strlen(prefix));
+            int id = -1;
+            if (std::from_chars(rest.data(), rest.data() + rest.size(), id).ec == std::errc{}) {
+                if (auto* v = voice_of_vfo(id); v && v->publication) {
+                    v->publication->retire();
+                    v->dirty = true;
+                }
+            }
+        }
+    }
     return exc_before_command(m);
 }
 
 }  // namespace trunk
+
+#ifdef TT01_K_TYPED_CONTROL_QUALIFICATION
+namespace p25_control {
+bool enqueue(const dig::DigitalDecoder* decoder,const Observation& o){
+    namespace mo=managed_iq::manual_output;
+    const auto ctx=mo::context;
+    if(!decoder||!ctx.stamp||ctx.closing||!ctx.generation||
+       !ctx.stamp->segment()||!ctx.stamp->observed_rf().bound||
+       ctx.stamp->decoder_identity()!=decoder)return false;
+    const auto at=trunk::now_ms();
+    const int vfo=decoder->vfo();
+    if(!trunk::kshadow::in_range(vfo))return false;
+    return mo::admit_report(*ctx.stamp,decoder,ctx.stamp->authority(),ctx.generation,[&]{
+        std::lock_guard lock(trunk::g_qmu);
+        // Shared native manual capacity and host enqueue order, including
+        // the existing loss fence if any typed frame cannot be queued.
+        if(trunk::g_manual_output.size()>=mo::cap||
+           trunk::g_ingress_next==trunk::NO_INGRESS){
+            ctx.stamp->authority()->lose_manual_locked();return false;
+        }
+        trunk::g_manual_output.push_back({trunk::g_ingress_next,
+            trunk::TypedReport{vfo,at,o,ctx.stamp,ctx.generation}});
+        ++trunk::g_ingress_next;
+        return true;
+    });
+}
+} // namespace p25_control
+#endif
+
+#ifdef TT01_EVENT_AUDIT_QUALIFICATION
+namespace managed_iq::event_audit {
+void count_staged(size_t n,size_t filtered){
+    std::lock_guard lock(trunk::g_qmu);trunk::g_event_audit_stats.staged+=n;trunk::g_event_audit_stats.filtered+=filtered;
+}
+void count_discarded(size_t n){
+    std::lock_guard lock(trunk::g_qmu);trunk::g_event_audit_stats.discarded+=n;
+}
+bool enqueue(std::shared_ptr<const EventBatch> b){
+    if(!b||b->calls.empty()||b->calls.size()>batch_cap||!b->claim_submission())return false;
+    if(hook)hook(Stage::before_enqueue,*b);
+    bool overflow=false;
+    const bool accepted=b->stamp.admit(b->stamp.decoder_identity(),[&]{
+        std::lock_guard lock(trunk::g_qmu);
+        if(trunk::g_event_audit.size()>=queue_cap
+#ifdef TT01_K_SHADOW_QUALIFICATION
+            ||trunk::g_ingress_next==trunk::NO_INGRESS
+#endif
+        ){
+            overflow=true;trunk::g_event_audit_stats.overflow+=b->calls.size();
+#ifdef TT01_MANAGED_LOSS_QUALIFICATION
+            b->stamp.retire_admitted();
+#endif
+            return false;
+        }
+#ifdef TT01_K_SHADOW_QUALIFICATION
+        trunk::g_event_audit.push_back({trunk::g_ingress_next,b});++trunk::g_ingress_next;
+#else
+        trunk::g_event_audit.push_back(b);
+#endif
+        trunk::g_event_audit_stats.accepted+=b->calls.size();return true;
+    });
+    if(!accepted&&!overflow){std::lock_guard lock(trunk::g_qmu);trunk::g_event_audit_stats.refused+=b->calls.size();}
+    return accepted;
+}
+Stats stats(){std::lock_guard lock(trunk::g_qmu);return trunk::g_event_audit_stats;}
+}
+#endif
+
+#ifdef TT01_D1_PCM_QUALIFICATION
+namespace managed_iq::pcm {
+bool enqueue(std::shared_ptr<const Batch> b){
+    if(!b||b->samples.empty()||b->samples.size()>batch_cap||b->submitted.exchange(true))return false;
+    if(hook)hook(Stage::before_enqueue,*b);
+    return b->stamp.admit(b->stamp.decoder_identity(),[&]{
+        std::lock_guard lock(trunk::g_qmu);
+        if(trunk::g_event_audit.size()>=event_audit::queue_cap||trunk::g_ingress_next==trunk::NO_INGRESS){
+            b->stamp.retire_admitted();return false;
+        }
+        trunk::g_event_audit.push_back({trunk::g_ingress_next,b});++trunk::g_ingress_next;return true;
+    });
+}
+Stats stats(int vfo){return trunk::kshadow::in_range(vfo)?trunk::pcm_lane::buffers[vfo].counts:Stats{};}
+std::vector<float> current_samples(int vfo){
+    std::vector<float> out;
+    if(!trunk::kshadow::in_range(vfo))return out;
+    auto& b=trunk::pcm_lane::buffers[vfo];
+#ifdef TT01_D2_MANAGER_QUALIFICATION
+    if(!b.key)return out;
+    auto copy=b.delivery;
+    auto read=copy.take(*b.key,trunk::now_ms(),buffer_cap,[](const Batch& item){return trunk::pcm_lane::admit(item,[]{return true;});});
+    for(auto& s:read.slices)out.insert(out.end(),s.batch->samples.begin()+s.begin,s.batch->samples.begin()+s.begin+s.count);
+    return out;
+#else
+    out.reserve(buffer_cap);
+    for(auto& item:b.batches)
+        if(!trunk::pcm_lane::admit(*item,[&]{out.insert(out.end(),item->samples.begin(),item->samples.end());return true;})){
+            out.clear();trunk::pcm_lane::clear(vfo);return out;
+        }
+    return out;
+#endif
+}
+#ifdef TT01_D2_MANAGER_QUALIFICATION
+DeliveryQueue::Read take_samples(int vfo,size_t budget){
+    if(!trunk::kshadow::in_range(vfo))return {};
+    auto& b=trunk::pcm_lane::buffers[vfo];
+    if(!b.key)return {};
+    return b.delivery.take(*b.key,trunk::now_ms(),std::min(budget,buffer_cap),[](const Batch& item){return trunk::pcm_lane::admit(item,[]{return true;});});
+}
+#ifdef TT01_D2_PUBLISH_QUALIFICATION
+bool encoder_authority_current(const EncoderWitness& w){
+    return trunk::pcm_lane::admit(w,[]{return true;});
+}
+#endif
+bool delivery_current(const DeliveryQueue::Read& r){
+    if(r.result!=DeliveryQueue::Result::ready||r.slices.empty())return false;
+    for(const auto& s:r.slices){
+        if(!s.batch||trunk::now_ms()-s.acknowledged_ms>=250||
+           !trunk::pcm_lane::admit(*s.batch,[]{return true;}))return false;
+    }
+    return true;
+}
+#endif
+}
+#endif
+#ifdef TT01_LIFECYCLE_QUALIFICATION
+namespace managed_iq::lifecycle {
+Snapshot snapshot(int vfo){
+    Snapshot out;
+    auto* v=trunk::voice_of_vfo(vfo);
+    if(!v)return out;
+    auto it=trunk::g_calls.find(v->call);
+    if(it==trunk::g_calls.end())return out;
+    out.selected=true;out.manager_state=trunk::cstate_name(it->second.st);
+    const auto& c=v->lifecycle;
+    out.state=c.state;out.token=c.token;out.generation=c.generation;out.sync=c.sync;out.seq=c.seq;
+    auto inst=trunk::live(*v);auto dd=inst?inst->getDigital():nullptr;
+    out.current=dd&&v->lifecycle_evidence&&
+#ifdef TT01_K_TYPED_CONTROL_QUALIFICATION
+        trunk::kshadow::voice_admit(vfo,v->lifecycle_evidence->stamp,dd.get(),[]{return true;});
+#else
+        v->lifecycle_evidence->stamp.admit(dd.get(),[]{return true;});
+#endif
+    return out;
+}
+Stats stats(){return trunk::g_lifecycle_stats;}
+}
+#endif
+
+#ifdef TT01_MANUAL_OUTPUT_QUALIFICATION
+namespace managed_iq::manual_output {
+void count_quarantined(bool closing){
+    std::lock_guard lock(trunk::g_qmu);
+    if(closing)++trunk::g_manual_output_stats.closing;
+    else ++trunk::g_manual_output_stats.unattributed;
+}
+void count_callback_refused(){std::lock_guard lock(trunk::g_qmu);++trunk::g_manual_output_stats.callback_refused;}
+Stats stats(){std::lock_guard lock(trunk::g_qmu);return trunk::g_manual_output_stats;}
+}
+#endif

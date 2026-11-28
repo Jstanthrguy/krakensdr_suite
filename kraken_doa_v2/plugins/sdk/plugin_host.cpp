@@ -563,6 +563,16 @@ public:
             n -= k;
         }
     }
+#ifdef TT01_D1_PCM_WIRE
+    void p25_pcm(uint32_t target,uint32_t src,uint16_t nac,uint8_t phase,uint8_t lch,bool group,const float* pcm,size_t n) override {
+        if(!pcm||!n||n>1440||n%160)return;
+        char bytes[16+1440*sizeof(float)]={};
+        auto word=[&](int i,uint32_t v){for(int k=0;k<4;++k)bytes[i+k]=char(v>>(24-8*k));};
+        word(0,target);word(4,src);bytes[8]=char(nac>>8);bytes[9]=char(nac);
+        bytes[10]=char(phase);bytes[11]=char(lch);bytes[12]=char(group);
+        memcpy(bytes+16,pcm,n*sizeof(float));send(kp::wire::P25_PCM,bytes,16+n*sizeof(float));
+    }
+#endif
     void audio_channel(int channel) override {
         if (channel == audio_channel_) return;   // sent when it changes
         audio_channel_ = channel;
@@ -722,6 +732,14 @@ public:
         const std::string p = tr_call_payload(tr_call(c, &n));
         send(kp::wire::CALL, p.data(), p.size());
     }
+#ifdef TT01_K_CONTROL_WIRE
+    void p25_control_tsbk(uint16_t nac,const uint8_t* block) override {
+        if(nac>0xfff||!block)return;
+        char p[14];p[0]=char(nac>>8);p[1]=char(nac&255);
+        memcpy(p+2,block,12);
+        send(kp::wire::P25_CONTROL_TSBK,p,sizeof p);
+    }
+#endif
     void send_channel(uint32_t type, const kp::TrunkChannel& c) {
         uint64_t n = 0;
         const kp::TrunkChannel o = tr_channel(c, &n);

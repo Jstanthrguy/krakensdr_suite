@@ -30,6 +30,13 @@
 #include "utils/fs_compat.hpp"
 #include "utils/tls_compat.hpp"
 #include "trunk_follow.hpp"
+#ifdef TT01_D2_PUBLISH_QUALIFICATION
+#include "networking/managed_audio_mix.hpp"
+#ifdef TT01_D3_TRANSPORT_QUALIFICATION
+#include "networking/audio_epoch_wire.hpp"
+#endif
+#endif
+
 #include "cert_status.hpp"
 #include "settings_store.hpp"
 #include <sys/stat.h>
@@ -66,6 +73,9 @@ namespace {
 
 // Per-connection state stored by uWS for each WebSocket.
 struct PerSocketData {
+#ifdef TT01_D3_TRANSPORT_QUALIFICATION
+    bool audio_epoch=false;
+#endif
     bool authed = false;     // has this connection passed the AUTH gate?
     uint32_t sub_mask = 0;   // subscribed data streams (0 = unset; see SUB_*)
     // Spectrum views (FFT_VIEW:, FFT message type 7): once a page sends one,
@@ -189,6 +199,47 @@ constexpr int64_t AUTH_DEADLINE_MS = 10000;      // ...each closed after this
 constexpr int AUTH_MAX_FAILURES = 5;             // wrong tokens per IP...
 constexpr int64_t AUTH_FAILURE_WINDOW_MS = 60000;  // ...per window, then refused
 std::unordered_map<ClientWS*, int64_t> g_pending_auth;           // socket -> opened (steady ms)
+#ifdef TT01_D3_TRANSPORT_QUALIFICATION
+namespace aw=managed_iq::audio_wire;
+namespace af=managed_iq::audio_fence;
+aw::Transport epoch_audio;
+std::unordered_set<ClientWS*> epoch_sockets;
+bool epoch_active(){return fm_enabled.load()&&!sweep_mode_enabled.load()&&audio_mixer.is_processing_enabled();}
+bool epoch_send(ClientWS* ws,std::string_view wire,uWS::OpCode op){
+    // Qualification only: close an opted-in slow client rather than silently
+    // drop an audio boundary. Does not change global FFT/video policy.
+    if(ws->getBufferedAmount()>128*1024||ws->send(wire,op,false)!=ClientWS::SUCCESS){
+        epoch_sockets.erase(ws);ws->close();return false;
+    }
+    return true;
+}
+void epoch_broadcast(const std::string& wire){
+    const std::vector<ClientWS*> sockets(epoch_sockets.begin(),epoch_sockets.end());
+    for(auto* ws:sockets)if(epoch_sockets.count(ws))epoch_send(ws,wire,uWS::BINARY);
+}
+void epoch_observe(){
+    if(auto reset=epoch_audio.observe(af::capture(),epoch_active()))epoch_broadcast(*reset);
+    if(epoch_audio.dead()){
+        const std::vector<ClientWS*> sockets(epoch_sockets.begin(),epoch_sockets.end());
+        for(auto* ws:sockets)if(epoch_sockets.count(ws))ws->close();
+    }
+}
+void epoch_interrupt(){if(auto reset=epoch_audio.interrupt())epoch_broadcast(*reset);}
+bool epoch_subscription(ClientWS* ws){
+    auto* ud=ws->getUserData();
+    if(!ud->audio_epoch)return true;
+    if(!(ud->sub_mask&SUB_AUDIO)){
+        if(epoch_sockets.erase(ws))return epoch_send(ws,epoch_audio.snapshot(),uWS::BINARY);
+        return true;
+    }
+    if(epoch_sockets.count(ws))return true;
+    // Join on a fresh encoder epoch for all opted-in listeners.
+    af::mark();epoch_observe();
+    if(epoch_audio.dead()){ws->close();return false;}
+    if(!epoch_send(ws,epoch_audio.snapshot(),uWS::BINARY))return false;
+    epoch_sockets.insert(ws);return true;
+}
+#endif
 std::unordered_set<ClientWS*> g_spec_sockets;  // sockets with spectrum views (uWS loop only)
 std::unordered_set<ClientWS*> g_video_sockets;  // sockets subscribed to decoder video (uWS loop only)
 std::unordered_set<ClientWS*> g_bin_doa_sockets;  // 🎨 sockets taking type 9 (uWS loop only)
@@ -269,7 +320,11 @@ void apply_subscriptions(WS* ws, uint32_t mask) {
     // a page with spectrum views is sent its own spectra (send_spectrum_views)
     if ((mask & SUB_FFT) && !ws->getUserData()->spec_views) ws->subscribe(TOPIC_FFT);
     else ws->unsubscribe(TOPIC_FFT);
+#ifdef TT01_D3_TRANSPORT_QUALIFICATION
+    ws->unsubscribe(TOPIC_AUDIO); // no untagged managed audio to legacy clients
+#else
     if (mask & SUB_AUDIO) ws->subscribe(TOPIC_AUDIO); else ws->unsubscribe(TOPIC_AUDIO);
+#endif
     if (mask & SUB_DOA)   ws->subscribe(TOPIC_DOA);   else ws->unsubscribe(TOPIC_DOA);
     // publish_video sends per socket (its own backpressure drop), so track the
     // subscribers in a set rather than relying on the topic alone
@@ -646,6 +701,9 @@ void send_spectrum_views(const SpectrumSnapshot& snap, const vector<BeamformedSp
 // it can also run right after a successful AUTH.
 template<typename WS>
 void subscribe_and_sync(WS* ws) {
+#ifdef TT01_D3_TRANSPORT_QUALIFICATION
+    if(!epoch_send(ws,"{\"audio_epoch_required\":1}",uWS::TEXT))return;
+#endif
     uint32_t mask = ws->getUserData()->sub_mask;
     if (mask == 0) mask = SUB_ALL;  // default: all streams
     apply_subscriptions(ws, mask);
@@ -1239,6 +1297,13 @@ uWS::SSLApp WebSocketServer::create_ssl_app() {
             }
             if (auth_required() && !ud->authed) return;  // drop until authed
 
+#ifdef TT01_D3_TRANSPORT_QUALIFICATION
+            if(message=="AUDIO_EPOCH:1"){
+                ud->audio_epoch=true;
+                if(!epoch_send(ws,"{\"audio_epoch\":1}",uWS::TEXT))return;
+                epoch_subscription(ws);return;
+            }
+#endif
             // --- Per-connection stream subscription (transport-level) ---
             if (message.starts_with("SUBSCRIBE:")) {
                 uint32_t mask = parse_sub_mask(message.substr(10));
@@ -1248,7 +1313,12 @@ uWS::SSLApp WebSocketServer::create_ssl_app() {
                     + ",\"audio\":" + ((mask & SUB_AUDIO) ? "true" : "false")
                     + ",\"doa\":"   + ((mask & SUB_DOA)   ? "true" : "false")
                     + ",\"video\":" + ((mask & SUB_VIDEO) ? "true" : "false") + "}}";
+#ifdef TT01_D3_TRANSPORT_QUALIFICATION
+                if(ud->audio_epoch){if(!epoch_send(ws,ack,uWS::TEXT))return;epoch_subscription(ws);}
+                else ws->send(ack,uWS::TEXT);
+#else
                 ws->send(ack, uWS::TEXT);
+#endif
                 return;
             }
 
@@ -1325,6 +1395,9 @@ uWS::SSLApp WebSocketServer::create_ssl_app() {
 
         .close = [](auto* ws, int code, string_view reason) {
             g_pending_auth.erase(ws);
+#ifdef TT01_D3_TRANSPORT_QUALIFICATION
+            epoch_sockets.erase(ws);
+#endif
             g_spec_sockets.erase(ws);
             g_sweep_sockets.erase(ws);
             g_net_sockets.erase(ws);
@@ -1531,6 +1604,9 @@ void WebSocketServer::web_server_main() {
                 us_timer_set(audio_timer, [](struct us_timer_t* /*timer*/) {
                     if (!global_ssl_app) return;
 
+#ifdef TT01_D3_TRANSPORT_QUALIFICATION
+                    epoch_observe(); // also when no audio packets will follow
+#endif
                     if (!fm_enabled.load() || sweep_mode_enabled.load(std::memory_order_relaxed)) {
                         return;   // (sweep mode: nothing is demodulated)
                     }
@@ -1546,10 +1622,24 @@ void WebSocketServer::web_server_main() {
                     int packets;
                     for (packets = 0; packets < 3 && due_us <= now_us; packets++) due_us += period_us;
                     for (int i = 0; i < packets; i++) {
+#ifdef TT01_D3_TRANSPORT_QUALIFICATION
+                        const bool admitted=managed_iq::audio_mix::publish_packet_versioned(AUDIO_SAMPLES_PER_PACKET,[](std::string_view wire,uint64_t rev,uint64_t ep,uint64_t seq){
+                            epoch_observe();
+                            auto packet=epoch_audio.packet(wire,rev,ep,seq);
+                            if(!packet)return false;
+                            epoch_broadcast(*packet);return true;
+                        });
+                        if(!admitted){epoch_observe();epoch_interrupt();}
+#elif defined(TT01_D2_PUBLISH_QUALIFICATION)
+                        managed_iq::audio_mix::publish_packet(AUDIO_SAMPLES_PER_PACKET,[](std::string_view wire,uint64_t,uint64_t){
+                            return global_ssl_app&&global_ssl_app->publish(TOPIC_AUDIO,wire,uWS::BINARY,false);
+                        });
+#else
                         auto audio_message = MessageBuilders::build_audio_message();
                         if (!audio_message.empty()) {
                             global_ssl_app->publish(TOPIC_AUDIO, audio_message, uWS::BINARY, false);
                         }
+#endif
                     }
                 }, audio_timer_ms, audio_timer_ms);
                 

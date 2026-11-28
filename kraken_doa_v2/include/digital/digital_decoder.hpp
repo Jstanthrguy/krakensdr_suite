@@ -32,6 +32,9 @@
 #include "digital/dig_report.hpp"
 #include "digital/trunk_event.hpp"
 
+namespace managed_iq { class WorkerEnvelope; class ManualEnvelope; class Publication; }
+class DecimatorManager;
+
 namespace dig {
 
 class Engine;   // plugin processes + front end (digital_decoder.cpp)
@@ -256,7 +259,13 @@ public:
     // its internal streams still go - they must stay continuous
     void push(const std::complex<float>* x, size_t n, float rate_hz, double rf_hz, uint64_t pos = NO_POS,
               const std::complex<int16_t>* mc = nullptr, int mc_m = 0, int bw_hz = 0, const AuxStream* aux = nullptr,
-              size_t naux = 0);
+              size_t naux = 0, std::shared_ptr<const managed_iq::ManualEnvelope> manual = {});
+    // Offline B8B4B1 admission only; ordinary builds refuse submission.
+    bool push_managed(std::shared_ptr<const managed_iq::WorkerEnvelope> envelope);
+    struct ManagedQueueStats {
+        uint64_t accepted=0, refused=0, overflow=0, stale=0, started=0;
+    };
+    ManagedQueueStats managed_queue_stats();
     static constexpr float MC_SCALE = 8192.0f;   // = kp::wire::MC_SCALE
     // a multichannel plugin runs on the VFO's own stream (the pipeline then
     // hands every antenna over; one on an internal stream: StreamWant::mc)
@@ -290,7 +299,17 @@ public:
     // bursts are queued (copied). Spatial reports go to the spatial handler
     // (the VFO's TalkerDoa) on the worker thread.
     bool wants_array() const { return want_array_.load(std::memory_order_relaxed); }
-    void push_array(const std::complex<float>* const* ch, int m, size_t n, float rate_hz, double rf_hz, uint64_t pos);
+    void push_array(const std::complex<float>* const* ch, int m, size_t n, float rate_hz, double rf_hz, uint64_t pos,
+                    std::shared_ptr<const managed_iq::ManualEnvelope> manual = {});
+    struct RoleQueueStats {
+        uint64_t accepted=0,refused=0,overflow=0,stale=0,started=0,finished=0,retired=0,shutdown=0;
+        uint64_t managed_shutdown=0,managed_completed=0,managed_failed=0;
+    };
+    RoleQueueStats role_queue_stats();
+    // Offline explicit shutdown probe, absent from the operational build.
+#ifndef TT01_OPERATIONAL_BUILD
+    bool qualification_stop();
+#endif
     void set_array_wanted(bool on, double burst_s, double period_s, bool only);   // Engine
     void set_spatial_handler(SpatialHandler h);
     void deliver_spatial(const SpatialReport& s);
@@ -401,13 +420,21 @@ private:
         int bw = 0;                              // the VFO's bandwidth (push's bw_hz)
         std::vector<AuxBlock> aux;               // internal streams (push's aux)
         double dur = 0;                          // seconds of signal (the queue's cap)
+        std::shared_ptr<const managed_iq::WorkerEnvelope> managed;
+        std::shared_ptr<const managed_iq::ManualEnvelope> manual;
     };
     std::atomic<bool> want_mc_{false};
     std::mutex q_mu_;
     std::condition_variable q_cv_;
     std::deque<Block> queue_;
+    ManagedQueueStats managed_stats_; // q_mu_ only
+    RoleQueueStats role_stats_;
+    std::atomic<std::shared_ptr<managed_iq::Publication>> role_authority_;
+    friend class ::DecimatorManager;
+    void bind_role(std::shared_ptr<managed_iq::Publication> pub);
     double queued_s_ = 0;   // seconds queued (QUEUE_MAX_SECONDS)
     void enqueue(Block&& b);
+    void enqueue_locked(Block&& b);
     std::atomic<uint64_t> dropped_{0};
     bool stop_ = false;
     std::thread worker_;

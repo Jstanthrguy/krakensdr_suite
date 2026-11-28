@@ -635,6 +635,16 @@ public:
     // stdout: in live mode it carries the binary protocol (the host redirects
     // printf/std::cout to stderr anyway).
     virtual void log(const std::string& text) = 0;
+#ifdef TT01_K_CONTROL_WIRE
+    // Qualification-only private extension. Build the entire isolated child
+    // with the same flag; existing wire messages and host ABI stay unchanged.
+    virtual void p25_control_tsbk(uint16_t nac,const uint8_t* block){(void)nac;(void)block;}
+#endif
+#ifdef TT01_D1_PCM_WIRE
+    virtual void p25_pcm(uint32_t target,uint32_t src,uint16_t nac,uint8_t phase,uint8_t lch,bool group,const float* pcm,size_t n){
+        (void)target;(void)src;(void)nac;(void)phase;(void)lch;(void)group;(void)pcm;(void)n;
+    }
+#endif
 };
 
 class Decoder {
@@ -787,6 +797,12 @@ constexpr uint32_t GRANT_END = 47;         // CH: Host::grant_end
 // state (0 ENDED, 1 ACTIVE, 2 RELEASED) '\0' target '\0' group (0/1) '\0'
 // source '\0' slot '\0' flags (e encrypted, m emergency)
 constexpr uint32_t CALL = 48;
+#ifdef TT01_K_CONTROL_WIRE
+constexpr uint32_t P25_CONTROL_TSBK = 49;
+#endif
+#ifdef TT01_D1_PCM_WIRE
+constexpr uint32_t P25_PCM=50;
+#endif
 // limits (both ends enforce them: the plugin side cuts / drops, kraken_doa
 // checks everything again): bytes, cut at a character boundary
 constexpr size_t TRUNK_KEY_MAX = 48;       // TrunkSystem::key ([A-Za-z0-9._-], others -> '_')

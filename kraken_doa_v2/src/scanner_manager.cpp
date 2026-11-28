@@ -1,6 +1,10 @@
 #include "scanner_manager.hpp"
 #include "utils/json_escape.hpp"
 #include "globals.hpp"
+#ifdef TT01_D2_PUBLISH_QUALIFICATION
+#include "networking/audio_publish_fence.hpp"
+#endif
+
 #include "control_handler.hpp"
 #include "networking/websocket_server.hpp"
 #include "networking/data_receiver.hpp"
@@ -430,6 +434,10 @@ bool ScannerManager::start() {
     fm_enabled_before_scanner = fm_enabled.load();
     if (fm_enabled.load()) {
         fm_enabled = false;
+#ifdef TT01_D2_PUBLISH_QUALIFICATION
+        managed_iq::audio_fence::discontinuity();
+#endif
+
         cout << "FM demodulator paused during scanning" << endl;
     }
 
@@ -469,6 +477,10 @@ bool ScannerManager::stop() {
     // Restore FM demodulator state if it was enabled before scanning
     if (fm_enabled_before_scanner.load()) {
         fm_enabled = true;
+#ifdef TT01_D2_PUBLISH_QUALIFICATION
+        managed_iq::audio_fence::discontinuity();
+#endif
+
         cout << "FM demodulator restored after scanning" << endl;
     }
 

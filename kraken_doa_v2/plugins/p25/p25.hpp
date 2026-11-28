@@ -84,8 +84,13 @@ private:
     struct Ldu { char fr[9][8][23]; };
     std::vector<Ldu> held_;
     static constexpr size_t MAX_HELD = 2;
+#ifdef TT01_D1_PCM_WIRE
+    void voice_frames(const std::vector<uint8_t>& sf,int current_nac);
+    void play_ldu(Ldu& l,bool held=false,int current_nac=-1);
+#else
     void voice_frames(const std::vector<uint8_t>& sf);
     void play_ldu(Ldu& l);
+#endif
     void link_control(const uint8_t* lc, const char* where);
     void voice_user(uint32_t src, const std::string& desc, const std::string& desc_nosrc, bool prot);
     void voice_activity();

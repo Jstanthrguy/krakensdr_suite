@@ -521,7 +521,11 @@ void P25Proto::tsbk(const uint8_t* t, bool tdma) {
 // until the next LDU2's encryption sync says: clear - its frames play, none
 // lost (the host's voice FIFO starts at 250 ms buffered: held and released,
 // two LDUs reach it as when they come 180 ms apart); encrypted - dropped.
-void P25Proto::voice_frames(const std::vector<uint8_t>& sf) {
+void P25Proto::voice_frames(const std::vector<uint8_t>& sf
+#ifdef TT01_D1_PCM_WIRE
+                            ,int current_nac
+#endif
+                            ) {
     if (!ctx_.voice_wanted || !ctx_.voice_wanted()) {
         held_.clear();
         return;
@@ -548,20 +552,42 @@ void P25Proto::voice_frames(const std::vector<uint8_t>& sf) {
             ctx_.voice_state((call_desc_.empty() ? std::string("Voice") : call_desc_) + ": encryption not known yet, held");
         return;
     }
+#ifdef TT01_D1_PCM_WIRE
+    for (Ldu& h : held_) play_ldu(h,true);
+#else
     for (Ldu& h : held_) play_ldu(h);
+#endif
     held_.clear();
+#ifdef TT01_D1_PCM_WIRE
+    play_ldu(l,false,current_nac);
+#else
     play_ldu(l);
+#endif
 }
 
-void P25Proto::play_ldu(Ldu& l) {
+void P25Proto::play_ldu(Ldu& l
+#ifdef TT01_D1_PCM_WIRE
+                       ,bool held,int current_nac
+#endif
+                       ) {
     float pcm[9 * 160];
     int good = 0;
     for (int f = 0; f < 9; f++)
         if (imbe_.decode(l.fr[f], pcm + 160 * f) >= 0) good++;
     // the talker channel of this audio: Phase 1's transmissions are channel 0
     // (the plugin's Phase 2 LCHs are 1 / 2)
-    if (ctx_.voice_channel) ctx_.voice_channel(0);
-    if (ctx_.voice) ctx_.voice(Mode::P25, pcm, 9 * 160);
+#ifdef TT01_D1_PCM_WIRE
+    if(trunk&&trunk->typed_pcm){
+        // Held frames may have been collected before identity was known;
+        // advance the existing codec state, but never relabel held PCM.
+        if(!held&&current_nac>=0&&call_tgt_&&clear_known()&&!encrypted())
+            trunk->pcm(call_tgt_,call_from_,uint16_t(current_nac),1,0,call_grp_,pcm,9*160);
+    }else
+#endif
+    {
+        if (ctx_.voice_channel) ctx_.voice_channel(0);
+        if (ctx_.voice) ctx_.voice(Mode::P25, pcm, 9 * 160);
+    }
     if (ctx_.voice_state)
         ctx_.voice_state((call_desc_.empty() ? std::string("Voice") : call_desc_) + ": playing (IMBE, " +
                          std::to_string(good) + "/9 frames clean)");
@@ -649,6 +675,9 @@ bool P25Proto::decode(const SymSrc& s) {
                     trunk->nac(nac);
                     trunk->control_seen();
                 }
+#ifdef TT01_K_CONTROL_WIRE
+                if(trunk)trunk->control_tsbk(nac,t);
+#endif
                 tsbk(t);
                 if (t[0] & 0x80) break;   // last block
             }
@@ -705,7 +734,11 @@ bool P25Proto::decode(const SymSrc& s) {
                 voice_activity();
                 r.set(Mode::P25, "Channel type", "Voice");
             }
+#ifdef TT01_D1_PCM_WIRE
+            if (valid) voice_frames(sf,nac);
+#else
             if (valid) voice_frames(sf);
+#endif
             if (valid) report_call();
             break;
         }

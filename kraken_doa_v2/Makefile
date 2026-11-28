@@ -113,6 +113,11 @@ else
     $(info Detected $(ARCH) architecture - using scalar optimizations)
 endif
 
+# Keep operational features consistent across all host translation units,
+# including normal autobuild and explicit CXXFLAGS overrides.
+include operational-profile.mk
+override CXXFLAGS += $(TT01_HOST_FLAGS)
+
 # Check if uWebSockets exists locally
 UWS_EXISTS := $(shell test -d uWebSockets && echo yes || echo no)
 # uWebSockets is pinned to the commit both apps are tested with (the

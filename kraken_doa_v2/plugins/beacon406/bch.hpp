@@ -6,6 +6,7 @@
 // 2). Decoded by syndrome tables: every pattern of <= t errors has its own
 // syndrome (minimum distance 7 / 5), so the table lookup is exact.
 
+#include <cstddef>
 #include <cstdint>
 #include <unordered_map>
 #include <vector>
@@ -16,16 +17,16 @@ class Bch {
 public:
     // gen: generator polynomial with its x^deg term (bit deg), n: code length
     Bch(uint32_t gen, int deg, int n, int t) : gen_(gen), deg_(deg), n_(n), t_(t) {
-        syn1_.resize(static_cast<size_t>(n));
+        syn1_.resize(static_cast<std::size_t>(n));
         for (int i = 0; i < n; i++) {
-            std::vector<uint8_t> e(static_cast<size_t>(n), 0);
-            e[static_cast<size_t>(i)] = 1;
-            syn1_[static_cast<size_t>(i)] = syndrome(e.data());
+            std::vector<uint8_t> e(static_cast<std::size_t>(n), 0);
+            e[static_cast<std::size_t>(i)] = 1;
+            syn1_[static_cast<std::size_t>(i)] = syndrome(e.data());
         }
         for (int i = 0; i < n; i++) {
-            tab_[syn1_[static_cast<size_t>(i)]] = pack(i, -1);
+            tab_[syn1_[static_cast<std::size_t>(i)]] = pack(i, -1);
             for (int j = i + 1; j < n; j++)
-                tab_[syn1_[static_cast<size_t>(i)] ^ syn1_[static_cast<size_t>(j)]] = pack(i, j);
+                tab_[syn1_[static_cast<std::size_t>(i)] ^ syn1_[static_cast<std::size_t>(j)]] = pack(i, j);
         }
     }
     int n() const { return n_; }
@@ -66,7 +67,7 @@ public:
         }
         if (t_ < 3) return -1;
         for (int k = 0; k < n_; k++) {
-            auto jt = tab_.find(s ^ syn1_[static_cast<size_t>(k)]);
+            auto jt = tab_.find(s ^ syn1_[static_cast<std::size_t>(k)]);
             if (jt == tab_.end()) continue;
             const int i = static_cast<int>(jt->second & 0xFFFF), j = static_cast<int>(jt->second >> 16) - 1;
             if (j < 0 || i == k || j == k) continue;

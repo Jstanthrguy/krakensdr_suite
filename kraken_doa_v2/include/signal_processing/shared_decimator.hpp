@@ -290,6 +290,10 @@ public:
     // with one VFO. The VFOs must be distinct decimators
     static void decimateVfos(VfoBlock* vfos, size_t count);
 
+    // Sequential producer only, between completed decimateVfos calls.
+    // Retire the filter tails and mixer phase of this VFO, not other VFOs.
+    void reset_stream_history();
+
     // Statistics
     size_t getBlocksProcessed() const { return total_blocks_processed.load(); }
     size_t getSamplesProcessed() const { return total_samples_processed.load(); }

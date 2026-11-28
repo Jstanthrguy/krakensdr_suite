@@ -1,5 +1,33 @@
 #include "digital/digital_decoder.hpp"
 #include "digital/dig_plugin.hpp"
+#ifdef TT01_K_TYPED_CONTROL_QUALIFICATION
+#include "networking/p25_control_evidence.hpp"
+#ifdef TT01_D1_PCM_QUALIFICATION
+#include "networking/managed_pcm.hpp"
+#endif
+#if !defined(TT01_MANUAL_OUTPUT_QUALIFICATION) || !defined(TT01_MANUAL_CONTINUITY_QUALIFICATION)
+#error typed control requires native manual admission
+#endif
+#endif
+#ifdef TT01_WORKER_QUALIFICATION
+#include "networking/managed_worker_envelope.hpp"
+#ifdef TT01_GENERATION_QUALIFICATION
+#include "networking/managed_generation_test.hpp"
+#ifdef TT01_SAMPLE_QUALIFICATION
+#include "networking/managed_sample_test.hpp"
+#ifdef TT01_EVENT_AUDIT_QUALIFICATION
+#include "networking/managed_event_audit.hpp"
+#endif
+#ifdef TT01_ROLE_QUALIFICATION
+#include "networking/manual_decoder_envelope.hpp"
+#include "networking/managed_role_shutdown_test.hpp"
+#ifdef TT01_MANUAL_OUTPUT_QUALIFICATION
+#include "networking/manual_output_audit.hpp"
+#endif
+#endif
+#endif
+#endif
+#endif
 
 #include <algorithm>
 #include <cctype>
@@ -28,7 +56,33 @@
 
 namespace dig {
 
+#ifdef TT01_MANUAL_RUNNER_QUALIFICATION
+// Isolated qualification fault at the actual settings transport boundary.
+// Close the exact child stdin before the real send; no fabricated result.
+namespace settings_test {
+bool (*before_send)(const DigitalDecoder*,uint32_t)=nullptr;
+void (*after_send)(const DigitalDecoder*,uint32_t,bool)=nullptr;
+}
+#endif
 namespace {
+#ifdef TT01_MANUAL_RUNNER_QUALIFICATION
+// Exact old source/domain/role and loss epoch; no fresh authority read
+// or locks held across child IO, callbacks, or teardown.
+void retire_manual_context_exact(){
+    namespace mo=managed_iq::manual_output;
+    auto c=mo::context;
+    if(!c.stamp||!c.generation||c.closing)return;
+#ifdef TT01_OPERATIONAL_BUILD
+    if(!c.stamp->segment())return;
+#endif
+    mo::admit(*c.stamp,c.stamp->decoder_identity(),c.stamp->authority(),[&]{
+        if(c.stamp->authority()->manual_loss_current(c.generation->loss))
+            c.stamp->authority()->lose_manual_locked();
+        return true;
+    });
+    c.generation->retire();
+}
+#endif
 constexpr float AFC_LIMIT_HZ = 4000.0f;
 constexpr int64_t DETECT_WINDOW_MS = 4000;
 constexpr size_t QUEUE_MAX_SECONDS = 1;
@@ -275,6 +329,9 @@ public:
     Engine(Report& r, DigitalDecoder* owner, bool sync_io, bool streams)
         : report_(r), owner_(owner), sync_io_(sync_io), streams_on_(streams) {}
     ~Engine() {
+#ifdef TT01_EVENT_AUDIT_QUALIFICATION
+        if(event_generation_)event_generation_->retire();
+#endif
         stop_all();
         destroy_resamplers();
     }
@@ -286,6 +343,347 @@ public:
         plugin_ = m == Mode::PLUGIN ? plugin : "";
         rebuild_runners();
     }
+
+#ifdef TT01_GENERATION_QUALIFICATION
+    // Worker-owned cold runner transition. B2A qualifies the control
+    // exchange only. The actual PluginProcess carries RESET/options/RF/SYNC;
+    // no SAMPLES and no callbacks from that pipe are admitted here.
+    void close_managed_generation() {
+#ifdef TT01_EVENT_AUDIT_QUALIFICATION
+        if(event_generation_)event_generation_->retire();
+        event_generation_.reset();
+#endif
+        configure(Mode::OFF,Options{},"");
+        destroy_resamplers();
+        reset_all();
+        in_rate_=0;rf_hz_=0;next_pos_=0;nco_phase_=0;vfo_bw_=0;
+        check_ms_=0;afc_changed_ms_=0;mixed_.clear();sbuf_.clear();
+    }
+    bool prepare_managed_generation(const managed_iq::WorkerEnvelope& e,uint32_t id,const std::function<bool()>& worker_running
+#ifdef TT01_MANAGED_STAGE_LOSS_QUALIFICATION
+        ,const std::function<void()>& retire
+#endif
+    ) {
+        namespace gt=managed_iq::generation_test;
+        using gt::Stage;
+        const auto& t=e.provenance().placement->tuple;
+        auto current=[&]{return e.admit(owner_,[&]{
+            return worker_running();
+        });};
+        auto say=[&](Stage stage,std::string_view detail={}){
+            return gt::trace(owner_,stage,e,id,detail);
+        };
+        auto fail=[&](std::string_view why){
+#ifdef TT01_MANAGED_STAGE_LOSS_QUALIFICATION
+            retire();
+#endif
+            close_managed_generation();
+            say(Stage::refused,why);
+            return false;
+        };
+        close_managed_generation();
+        say(Stage::closed);
+        if(!id||t.mode!=2||t.plugin!="p25"||!(e.rate()>0)||
+           !is_finite_value(e.provenance().observed_rf())||
+           !(e.provenance().observed_rf()>0)||!current())
+            return fail("invalid or retired envelope");
+        auto o=owner_->options();
+        if(owner_->mode()!=Mode::PLUGIN||owner_->plugin_id()!="p25"||o.plugin!=t.options)
+            return fail("live configuration mismatch");
+        // The tuple is authoritative for assignment options; require all
+        // supplied P25 keys to be declared, including hidden grant options.
+        PluginInfo pi;
+        if(!PluginRegistry::instance().get("p25",&pi)||!pi.built||
+           pi.array||pi.multichannel||pi.sample_rate!=48000)
+            return fail("unsupported runner");
+        std::map<std::string,std::string> full;
+        for(const auto& opt:pi.options)full.emplace(opt.key,opt.def);
+        for(const auto& kv:t.options){
+            if(kv.first.rfind("p25.",0)!=0)continue;
+            auto it=full.find(kv.first.substr(4));
+            if(it==full.end()||kv.second.size()>100||
+               std::any_of(kv.second.begin(),kv.second.end(),[](unsigned char c){return c<32||c==127;}))
+                return fail("invalid assignment option");
+            if(!kv.second.empty())it->second=kv.second;
+        }
+        if(!current())return fail("retired before runner start");
+        in_rate_=e.rate();vfo_bw_=t.bandwidth;rf_hz_=e.provenance().observed_rf();
+        next_pos_=e.pos();o.plugin=t.options;
+        configure(Mode::PLUGIN,o,"p25");
+        if(runners_.size()!=1)return fail("wrong runner count");
+        auto& r=*runners_.front();
+        start(r,now_ms());
+        if(!r.proc||!r.proc->alive(nullptr)||r.stream_w!=0)
+            return fail("runner failed to start");
+        // Cold process identity isolates all earlier pipe bytes; every
+        // control send is checked. SYNC means SDK processed preceding
+        // messages, not that option semantics or RF acquisition are proved.
+        auto send=[&](uint32_t type,const void* p,size_t n){
+            return current()&&r.proc->alive(nullptr)&&r.proc->send(type,p,n,0);
+        };
+        if(!send(W_RESET,nullptr,0))return fail("RESET send refused");
+        say(Stage::reset_sent);
+        char rf[64];snprintf(rf,sizeof rf,"%.1f",rf_hz_);
+        if(!send(W_RF,rf,strlen(rf)))return fail("RF send refused");
+        r.rf_sent=rf_hz_;say(Stage::rf_sent,rf);
+        for(const auto& kv:full){
+            const std::string payload=kv.first+"="+kv.second;
+            if(!send(W_OPTION,payload.data(),payload.size()))return fail("OPTION send refused");
+            say(Stage::option_sent,payload);
+        }
+        // Qualification child cannot produce audio or log data, even if
+        // this code is later exercised with an accidental sample input.
+#ifdef TT01_D1_PCM_QUALIFICATION
+        const char pcm_opt[]="__tt01_pcm=1";
+        if(!send(W_OPTION,pcm_opt,sizeof pcm_opt-1))return fail("typed PCM opt-in refused");
+        const uint8_t voice=1;
+#else
+        const uint8_t voice=0;
+#endif
+        if(!send(W_VOICE_WANTED,&voice,1))return fail("voice control send refused");
+        const auto fault=say(Stage::before_sync);
+        if(fault==gt::Fault::stop_child)r.proc->stop();
+        const uint32_t sent=fault==gt::Fault::wrong_sync_id?(id==UINT32_MAX?id-1:id+1):id;
+        if(fault!=gt::Fault::omit_sync){
+            if(!send(W_SYNC,&sent,sizeof sent))return fail("SYNC send refused");
+            say(Stage::sync_sent,std::to_string(sent));
+        }
+        // Absolute monotonic deadline. Do not use legacy drain() which
+        // treats a dead process as done. All other reports stay quarantined.
+        bool ack=false,bad=false;
+        const auto deadline=managed_iq::Clock::now()+std::chrono::milliseconds(500);
+        while(managed_iq::Clock::now()<deadline){
+            if(!current())return fail("retired while awaiting SYNC");
+            if(!r.proc->alive(nullptr)||r.proc->protocol_error())return fail("child died or malformed pipe");
+            r.proc->poll([&](uint32_t type,const char* payload,size_t len){
+                if(type!=W_SYNC_DONE)return;
+                uint32_t got=0;
+                if(len==sizeof got)memcpy(&got,payload,sizeof got);
+                if(len!=sizeof got||got!=id||ack)bad=true;
+                else ack=true;
+            });
+            if(bad||r.proc->protocol_error())return fail("wrong or malformed SYNC_DONE");
+            if(ack){
+                if(!r.proc->alive(nullptr)||r.proc->pending_writes())return fail("ACK with dead child or pending controls");
+                say(Stage::ack);
+                if(!current()||!r.proc->alive(nullptr))return fail("retired after ACK");
+                r.sync_sent=r.sync_done=r.trunk_fence=id;
+#ifdef TT01_EVENT_AUDIT_QUALIFICATION
+                event_generation_=std::make_shared<managed_iq::EventGeneration>(id);
+#endif
+                return true;
+            }
+            r.proc->wait_io(1);
+        }
+        return fail("SYNC_DONE deadline");
+    }
+#ifdef TT01_SAMPLE_QUALIFICATION
+    // Offline B2B1: bounded single-block wire transaction. Authorization
+    // of each operation is its linearization point. Retirement may race
+    // an already authorized nonblocking operation; that operation belongs
+    // only to the old process. No further operation is admitted, and the
+    // caller closes/reaps the old runner before any new generation.
+    bool deliver_managed_samples(const managed_iq::WorkerEnvelope& e,uint32_t generation,const std::function<bool()>& worker_running
+#ifdef TT01_MANAGED_STAGE_LOSS_QUALIFICATION
+        ,const std::function<void()>& retire
+#endif
+    ) {
+        namespace st=managed_iq::sample_test;
+        using st::Stage;
+        const auto& t=e.provenance().placement->tuple;
+        auto say=[&](Stage stage,uint32_t type=0,const void* p=nullptr,size_t n=0){
+            return st::trace(owner_,stage,e,generation,type,p,n);
+        };
+#ifdef TT01_EVENT_AUDIT_QUALIFICATION
+        namespace ea=managed_iq::event_audit;
+        std::vector<trunk::PluginEvent> staged;
+        size_t filtered=0;
+        bool stage_overflow=false;
+#ifdef TT01_D1_PCM_QUALIFICATION
+        std::vector<float> pcm_stage;
+        bool pcm_fault=false;
+#endif
+        struct StageAccounting{
+            std::vector<trunk::PluginEvent>& events;size_t& filtered;
+            bool published=false,finished=false;
+            void finish(){if(finished)return;finished=true;ea::count_staged(events.size(),filtered);if(!published)ea::count_discarded(events.size());}
+            ~StageAccounting(){finish();}
+        } stage_accounting{staged,filtered};
+#endif
+        auto fail=[&](const char* why){
+#ifdef TT01_MANAGED_STAGE_LOSS_QUALIFICATION
+            retire();
+#endif
+#ifdef TT01_EVENT_AUDIT_QUALIFICATION
+            stage_accounting.finish();
+#endif
+            say(Stage::refused,0,why,strlen(why));return false;
+        };
+        auto permit=[&]{
+            // Manager-fenced assignment writes are ordered by e.admit.
+            // Direct public decoder setters are not all fenced yet; this
+            // readback is additional refusal, not an exclusive config lock.
+            return owner_->mode()==Mode::PLUGIN&&owner_->plugin_id()=="p25"&&
+                owner_->options().plugin==t.options&&
+                e.admit(owner_,[&]{
+                    return worker_running();
+                });
+        };
+        say(Stage::before_prepare);
+        if(!permit()||!managed_runner_alive()||e.rate()!=in_rate_||
+           e.provenance().observed_rf()!=rf_hz_||e.pos()!=next_pos_)
+            return fail("retired or incompatible before sample preparation");
+        auto& r=*runners_[0];
+        if(r.proc->pending_writes()||r.sync_sent==UINT32_MAX)
+            return fail("pending wire work or sync exhaustion");
+        const uint32_t id=++r.sync_sent;
+        // Existing Engine DSP; do not enter generic process()/run()
+        // which could rebuild the runner or send mutable settings.
+        mix(e.samples().data(),e.samples().size(),in_rate_,nco_phase_,mixed_);
+        resample(e.samples().size());
+        const auto* rb=rate_buf(r);
+        if(!rb||rb->rate!=48000||r.stream_w!=0||rb->ny>48000)
+            return fail("invalid prepared resampling result");
+        size_t sent=0;
+        for(size_t p=0;p<rb->ny;p+=PLUGIN_CHUNK){
+            size_t n=std::min<size_t>(PLUGIN_CHUNK,rb->ny-p);
+            const auto fault=say(Stage::before_send,W_SAMPLES,rb->out.data()+p,n*sizeof(std::complex<float>));
+            if(fault==st::Fault::stop_child)r.proc->stop();
+            if(!permit()||!r.proc->alive(nullptr)||
+               !r.proc->send(W_SAMPLES,rb->out.data()+p,n*sizeof(std::complex<float>),48000*8))
+                return fail("sample send refused");
+            sent+=n;
+            say(Stage::sent,W_SAMPLES,nullptr,n);
+        }
+        auto fault=say(Stage::before_sync);
+        if(fault==st::Fault::stop_child)r.proc->stop();
+        const uint32_t wire_id=fault==st::Fault::wrong_sync?(id==UINT32_MAX?id-1:id+1):id;
+        if(!permit()||!r.proc->alive(nullptr))return fail("retired before sample SYNC");
+        if(fault!=st::Fault::omit_sync&&!r.proc->send(W_SYNC,&wire_id,sizeof wire_id,0))
+            return fail("sample SYNC send refused");
+        bool ack=false,bad=false;
+        const auto deadline=managed_iq::Clock::now()+std::chrono::milliseconds(500);
+        while(managed_iq::Clock::now()<deadline){
+            say(Stage::before_poll);
+            if(!permit()||!r.proc->alive(nullptr)||r.proc->protocol_error())
+                return fail("retired or dead before sample poll");
+            // poll() flushes only under an old-generation operation permit;
+            // no generic idle flush. Raw replies never reach on_message.
+            r.proc->poll([&](uint32_t type,const char* data,size_t len){
+                if(type==W_SYNC_DONE){
+                    uint32_t got=0;if(len==sizeof got)memcpy(&got,data,sizeof got);
+                    if(len!=sizeof got||got!=id||ack)bad=true;else ack=true;
+                }else{
+                    const auto report_fault=say(Stage::report,type,data,len);
+                    (void)report_fault;
+#ifdef TT01_EVENT_AUDIT_QUALIFICATION
+#ifdef TT01_D1_PCM_QUALIFICATION
+                    if(type==managed_iq::pcm::wire_type){
+                        namespace pc=managed_iq::pcm;
+                        if(ack)pcm_fault=true;
+                        else{
+                            auto status=pc::parse(std::string_view(data,len),*e.provenance().placement,pcm_stage);
+                            if(status==pc::Check::malformed||pcm_stage.size()>pc::batch_cap)pcm_fault=true;
+                        }
+                    }else
+#endif
+                    if(type==W_CALL){
+                        trunk::PluginEvent ev;
+                        if(ack||managed_iq::check_call(std::string_view(data,len),*e.provenance().placement,ev)!=managed_iq::CallCheck::matched)++filtered;
+                        else {
+                            size_t copies=1;
+#ifdef TT01_STAGE_CAP_STRESS
+                            // Explicit synthetic fan-out of a validated native
+                            // report, only in the stress variant. Real cap unchanged.
+                            if(report_fault==st::Fault::wrong_sync)copies=ea::batch_cap;
+                            if(report_fault==st::Fault::omit_sync)copies=ea::batch_cap+1;
+#endif
+                            for(size_t i=0;i<copies;++i){
+                                if(staged.size()>=ea::batch_cap){
+                                    stage_overflow=true;++filtered;
+#ifdef TT01_MANAGED_STAGE_LOSS_QUALIFICATION
+                                    retire(); // first known loss, before further ACK admission
+#endif
+                                }else staged.push_back(ev);
+                            }
+                        }
+                    }else if((type>=W_TRUNK_SYSTEM&&type<=W_CALL)
+#ifdef TT01_K_TYPED_CONTROL_QUALIFICATION
+                        ||type==p25_control::wire_type
+#endif
+                    )++filtered;
+#endif
+                }
+            });
+#if defined(TT01_MANAGED_STAGE_LOSS_QUALIFICATION) && defined(TT01_EVENT_AUDIT_QUALIFICATION)
+            if(stage_overflow)return fail("staged CALL overflow");
+#endif
+#ifdef TT01_D1_PCM_QUALIFICATION
+            if(pcm_fault)return fail("malformed or overflow typed PCM");
+#endif
+            if(bad||r.proc->protocol_error())return fail("bad sample SYNC_DONE");
+            if(ack){
+                say(Stage::acknowledged,W_SYNC_DONE,&id,sizeof id);
+                if(!permit()||!r.proc->alive(nullptr)||r.proc->pending_writes())
+                    return fail("retired or pending after sample ACK");
+#ifdef TT01_EVENT_AUDIT_QUALIFICATION
+                if(!staged.empty()&&!stage_overflow&&event_generation_){
+                    // Copy the small typed event vector; the accounting
+                    // scope retains count until its destructor. No samples
+                    // survive in the event queue.
+                    auto copy=staged;
+                    auto batch=std::make_shared<const managed_iq::EventBatch>(
+                        owner_->vfo(),e,event_generation_,id,r.written,r.written+sent,std::move(copy));
+                    stage_accounting.published=ea::enqueue(std::move(batch));
+#ifdef TT01_MANAGED_STAGE_LOSS_QUALIFICATION
+                    if(!stage_accounting.published)return fail("acknowledged CALL batch refused");
+#endif
+                }
+                stage_accounting.finish();
+#ifdef TT01_D1_PCM_QUALIFICATION
+                if(!pcm_stage.empty()&&event_generation_){
+                    auto batch=std::make_shared<const managed_iq::pcm::Batch>(
+                        owner_->vfo(),e,event_generation_,id,r.written,r.written+sent,std::move(pcm_stage));
+                    if(!managed_iq::pcm::enqueue(std::move(batch)))return fail("acknowledged PCM refused");
+                }
+#endif
+#endif
+                r.sync_done=id;r.written+=sent;
+                next_pos_=e.pos()+e.samples().size();
+                say(Stage::complete,0,nullptr,sent);
+                return true;
+            }
+            r.proc->wait_io(1);
+        }
+        return fail("sample SYNC deadline");
+    }
+#endif
+    bool managed_runner_alive() {
+        return runners_.size()==1&&runners_[0]->proc&&runners_[0]->proc->alive(nullptr)&&
+               !runners_[0]->proc->protocol_error();
+    }
+#ifdef TT01_INTEGRATED_RESIDUAL_QUALIFICATION
+    // No generic report callback or write flush outside the acknowledged
+    // operation. Pending writes at this boundary are themselves a fault.
+    bool managed_idle_clean(){
+        if(!managed_runner_alive())return false;
+        auto& r=*runners_[0];
+        if(r.proc->pending_writes())return false;
+        bool unexpected=false;
+        r.proc->poll([&](uint32_t type,const char*,size_t){
+            if(type==W_SYNC_DONE||(type>=W_TRUNK_SYSTEM&&type<=W_CALL)
+#ifdef TT01_K_TYPED_CONTROL_QUALIFICATION
+                ||type==p25_control::wire_type
+#endif
+#ifdef TT01_D1_PCM_QUALIFICATION
+                ||type==managed_iq::pcm::wire_type
+#endif
+            )unexpected=true;
+        });
+        return !unexpected&&managed_runner_alive()&&!r.proc->pending_writes();
+    }
+#endif
+#endif
 
     // the VFO moved (> 100 Hz): everything starts over
     void check_rf(double rf) {
@@ -310,7 +708,11 @@ public:
             Runner& r = *runners_[i];
             if (!r.known || !r.info.array || !r.proc) continue;
             r.array_rate = rate;
+#ifdef TT01_MANUAL_RUNNER_QUALIFICATION
+            if(!send_settings(r))continue;
+#else
             send_settings(r);
+#endif
             const size_t per = (MAX_PAYLOAD - 32) / (4 * static_cast<size_t>(m));
             const size_t backlog = sync_io_ ? SIZE_MAX : static_cast<size_t>(rate) * 4 * static_cast<size_t>(m);   // ~1 s
             for (size_t a = 0; a < n; a += per) {
@@ -452,6 +854,21 @@ public:
     // an array plugin is ~17 MB, the pipe holds 1 MB: written only when a new
     // block came in, the plugin got ~10 MB/s between bursts (the 100 ms
     // ticks) - less than the 17 MB/s it is sent - and the queue grew
+#ifdef TT01_MANUAL_RUNNER_QUALIFICATION
+    // Only used with a retained sample-bearing fixed P25 manual origin.
+    bool manual_runner_alive(){
+        return runners_.size()==1&&runners_[0]->proc&&
+            runners_[0]->proc->alive(nullptr)&&!runners_[0]->proc->protocol_error();
+    }
+    // Caller supplies the original retained operation scope. Poll even
+    // when there are no pending writes; this is not a new sample origin.
+    bool poll_manual_retained(){
+        if(!manual_runner_alive())return false;
+        auto& r=*runners_[0];
+        r.proc->poll([this](uint32_t type,const char* p,size_t n){on_message(0,type,p,n);});
+        return manual_runner_alive();
+    }
+#endif
     bool flush_pending() {
         bool more = false;
         for (size_t i = 0; i < runners_.size(); i++) {
@@ -572,6 +989,9 @@ private:
     std::string plugin_;
     Options opts_;
     std::vector<std::unique_ptr<Runner>> runners_;
+#ifdef TT01_EVENT_AUDIT_QUALIFICATION
+    std::shared_ptr<managed_iq::EventGeneration> event_generation_;
+#endif
     uint64_t reg_gen_ = 0;
     int64_t check_ms_ = 0;
 
@@ -1022,12 +1442,29 @@ private:
     // and the repeated messages are wanted
     bool log_all() const { return opts_.log == LOG_ALL && log_allowed_.load(); }
 
+#ifdef TT01_MANUAL_RUNNER_QUALIFICATION
+    bool send_settings(Runner& r) {
+        bool failed=false;
+        auto send=[&](uint32_t type,const void* data,size_t len,size_t cap){
+            if(failed)return;
+            if(settings_test::before_send&&settings_test::before_send(owner_,type))
+                r.proc->request_stop();
+            const bool sent=r.proc->send(type,data,len,cap);
+            if(!sent){failed=true;retire_manual_context_exact();}
+            if(settings_test::after_send)settings_test::after_send(owner_,type,sent);
+        };
+#else
     void send_settings(Runner& r) {
+#endif
         // kp::Host::verbose: "Show all messages", or Log All in effect
         const int verbose = opts_.verbose || log_all() ? 1 : 0;
         if (verbose != r.verbose_sent) {
             std::string kv = std::string("verbose=") + (verbose ? "1" : "0");
+#ifdef TT01_MANUAL_RUNNER_QUALIFICATION
+            send(W_OPTION, kv.data(), kv.size(), 0);
+#else
             r.proc->send(W_OPTION, kv.data(), kv.size(), 0);
+#endif
             r.verbose_sent = verbose;
         }
         // the receiver's location (kp::Host::station)
@@ -1038,7 +1475,11 @@ private:
                 std::lock_guard<std::mutex> lk(station_mu);
                 st = station_text;
             }
+#ifdef TT01_MANUAL_RUNNER_QUALIFICATION
+            send(W_STATION, st.data(), st.size(), 0);
+#else
             r.proc->send(W_STATION, st.data(), st.size(), 0);
+#endif
             r.station_sent = sg;
         }
         // the RF of the plugin's 0 Hz (kp::Host::rf_hz): the VFO's frequency
@@ -1048,14 +1489,22 @@ private:
         if (const double rf0 = rf_hz_ > 0 ? rf_hz_ + afc_hz_ : 0.0; r.rf_sent < 0 || std::fabs(rf0 - r.rf_sent) > 10.0) {
             char b[64] = "";
             if (rf0 > 0) snprintf(b, sizeof b, "%.1f", rf0);
+#ifdef TT01_MANUAL_RUNNER_QUALIFICATION
+            send(W_RF, b, strlen(b), 0);
+#else
             r.proc->send(W_RF, b, strlen(b), 0);
+#endif
             r.rf_sent = rf0;
         }
         // raw frames for the decoder data log (Log All)
         const int raw = log_all() ? 1 : 0;
         if (raw != r.raw_sent) {
             std::string kv = std::string("log_raw=") + (raw ? "1" : "0");
+#ifdef TT01_MANUAL_RUNNER_QUALIFICATION
+            send(W_OPTION, kv.data(), kv.size(), 0);
+#else
             r.proc->send(W_OPTION, kv.data(), kv.size(), 0);
+#endif
             r.raw_sent = raw;
         }
         // video plugins: is anyone watching? (kp::Host::video_wanted - they
@@ -1064,7 +1513,11 @@ private:
             const int vid = video_wanted.load() ? 1 : 0;
             if (vid != r.video_sent) {
                 std::string kv = std::string("video_wanted=") + (vid ? "1" : "0");
+#ifdef TT01_MANUAL_RUNNER_QUALIFICATION
+                send(W_OPTION, kv.data(), kv.size(), 0);
+#else
                 r.proc->send(W_OPTION, kv.data(), kv.size(), 0);
+#endif
                 r.video_sent = vid;
             }
         }
@@ -1072,7 +1525,11 @@ private:
         const int voice = (is_lead(r) && (owner_->voice_wanted() || owner_->voice_tap() || owner_->record_tap())) ? 1 : 0;
         if (voice != r.voice_sent) {
             uint8_t b = static_cast<uint8_t>(voice);
+#ifdef TT01_MANUAL_RUNNER_QUALIFICATION
+            send(W_VOICE_WANTED, &b, 1, 0);
+#else
             r.proc->send(W_VOICE_WANTED, &b, 1, 0);
+#endif
             r.voice_sent = voice;
         }
         // the plugin's own options ("<id>.<key>"); a removed one goes back
@@ -1085,15 +1542,26 @@ private:
             auto s = r.opts_sent.find(kv.first);
             if (s != r.opts_sent.end() && s->second == kv.second) continue;
             std::string m = kv.first + "=" + kv.second;
+#ifdef TT01_MANUAL_RUNNER_QUALIFICATION
+            send(W_OPTION, m.data(), m.size(), 0);
+#else
             r.proc->send(W_OPTION, m.data(), m.size(), 0);
+#endif
             r.opts_sent[kv.first] = kv.second;
         }
         for (auto it = r.opts_sent.begin(); it != r.opts_sent.end();) {
             if (want.count(it->first)) { ++it; continue; }
             std::string m = it->first + "=";
+#ifdef TT01_MANUAL_RUNNER_QUALIFICATION
+            send(W_OPTION, m.data(), m.size(), 0);
+#else
             r.proc->send(W_OPTION, m.data(), m.size(), 0);
+#endif
             it = r.opts_sent.erase(it);
         }
+#ifdef TT01_MANUAL_RUNNER_QUALIFICATION
+        return !failed;
+#endif
     }
 
     // y = this block resampled to the plugin's rate; its sample j is VFO
@@ -1112,7 +1580,11 @@ private:
             const Resampled* rb = rate_buf(r);
             if (!rb || rb->out.data() != y) ny = 0;
         }
+#ifdef TT01_MANUAL_RUNNER_QUALIFICATION
+        if(!send_settings(r))return;
+#else
         send_settings(r);
+#endif
         if (mc && ny) {
             // every antenna: SAMPLES_MC = uint32 m + n x m complex int16 (the
             // stream's rate: step 1 on the VFO's own)
@@ -1140,6 +1612,13 @@ private:
         for (size_t p = 0; p < ny; p += PLUGIN_CHUNK) {
             size_t k = std::min<size_t>(PLUGIN_CHUNK, ny - p);
             if (!r.proc->send(W_SAMPLES, y + p, k * sizeof(std::complex<float>), backlog)) {
+#ifdef TT01_MANUAL_CONTINUITY_QUALIFICATION
+#ifdef TT01_MANUAL_RUNNER_QUALIFICATION
+                retire_manual_context_exact();
+#else
+                managed_iq::manual_output::retire_context();
+#endif
+#endif
                 r.dropped += k;   // never reaches the plugin: its clock doesn't advance
                 continue;
             }
@@ -1155,6 +1634,13 @@ private:
         kproc::ExitStatus st;
         const bool bad = r.proc->protocol_error();
         if (bad || !r.proc->alive(&st)) {
+#ifdef TT01_MANUAL_CONTINUITY_QUALIFICATION
+#ifdef TT01_MANUAL_RUNNER_QUALIFICATION
+            retire_manual_context_exact();
+#else
+            managed_iq::manual_output::retire_context();
+#endif
+#endif
             r.proc->poll(handler);   // whatever it said last
             std::string why;
             if (bad) why = "sent a malformed message (printing to stdout?)";
@@ -1350,6 +1836,22 @@ private:
             case W_OPTION_CHOICES:
                 on_option_choices(r, p, len);
                 break;
+#ifdef TT01_K_TYPED_CONTROL_QUALIFICATION
+            case p25_control::wire_type: {
+                // Dedicated native evidence; no PluginEvent, ordinary
+                // callback, catalog fallback or managed voice CALL.
+                namespace mo=managed_iq::manual_output;
+                const auto& ctx=mo::context;
+                if(r.id!="p25"||!is_lead(r)||r.sync_done<r.trunk_fence||
+                   !ctx.stamp||ctx.closing||!ctx.generation||
+                   !ctx.stamp->segment()||!ctx.stamp->observed_rf().bound||
+                   ctx.stamp->decoder_identity()!=owner_)break;
+                if(auto o=p25_control::parse(std::string_view(p,len)))
+                    p25_control::enqueue(owner_,*o);
+                else retire_manual_context_exact();
+                break;
+            }
+#endif
             case W_TRUNK_SYSTEM:
             case W_TRUNK_CHANNEL:
             case W_CONTROL_CHANNEL:
@@ -1405,6 +1907,13 @@ private:
     }
     // the reports so far are stale: one RESET (only if there were any)
     void trunk_reset() {
+#ifdef TT01_MANUAL_CONTINUITY_QUALIFICATION
+#ifdef TT01_MANUAL_RUNNER_QUALIFICATION
+        retire_manual_context_exact();
+#else
+        managed_iq::manual_output::retire_context();
+#endif
+#endif
         if (trunk_from_.empty()) return;
         std::string id;
         id.swap(trunk_from_);
@@ -2057,6 +2566,9 @@ DigitalDecoder::DigitalDecoder(bool threaded, bool internal_streams)
 }
 
 DigitalDecoder::~DigitalDecoder() {
+#ifdef TT01_MANUAL_CONTINUITY_QUALIFICATION
+    managed_iq::Writer stopping(role_authority_.load());
+#endif
     {
         std::lock_guard<std::mutex> lk(q_mu_);
         stop_ = true;
@@ -2128,6 +2640,11 @@ bool DigitalDecoder::voice_wanted() const {
 }
 
 void DigitalDecoder::set_mode(Mode m, const std::string& plugin) {
+#ifdef TT01_ROLE_QUALIFICATION
+    auto authority=role_authority_.load();
+    managed_iq::Writer writer(authority);
+    if(authority&&!writer)return;
+#endif
     bool plugin_changed;
     {
         std::lock_guard<std::mutex> lk(opt_mu_);
@@ -2150,7 +2667,11 @@ void DigitalDecoder::set_mode(Mode m, const std::string& plugin) {
         if (m == Mode::PLUGIN) report_.event("", "Decoder set to " + plugin, 0.0);
         else if (m == Mode::AUTO) report_.event("", "Decoder on, detecting the mode automatically", 0.0);
     }
+#ifdef TT01_ROLE_QUALIFICATION
+    if (!authority && !worker_.joinable()) {
+#else
     if (!worker_.joinable()) {
+#endif
         if (reset_pending_.exchange(false)) engine_->reset_all();
         engine_->configure(m, options(), plugin_id());
     }
@@ -2162,6 +2683,11 @@ std::string DigitalDecoder::plugin_id() const {
 }
 
 void DigitalDecoder::set_options(const Options& o) {
+#ifdef TT01_ROLE_QUALIFICATION
+    auto authority=role_authority_.load();
+    managed_iq::Writer writer(authority);
+    if(authority&&!writer)return;
+#endif
     std::lock_guard<std::mutex> lk(opt_mu_);
     opts_ = o;
     log_mode_.store(o.log, std::memory_order_relaxed);
@@ -2188,7 +2714,21 @@ void DigitalDecoder::deliver_talker(const TalkerSpan& s) {
 }
 
 void DigitalDecoder::push(const std::complex<float>* x, size_t n, float rate_hz, double rf_hz, uint64_t pos,
-                          const std::complex<int16_t>* mc, int mc_m, int bw_hz, const AuxStream* aux, size_t naux) {
+                          const std::complex<int16_t>* mc, int mc_m, int bw_hz, const AuxStream* aux, size_t naux,
+                          std::shared_ptr<const managed_iq::ManualEnvelope> manual) {
+#ifdef TT01_ROLE_QUALIFICATION
+    auto authority=role_authority_.load();
+    if((authority||manual)&&(!authority||!manual||!manual->admit(this,authority,[]{return true;}))){
+        std::lock_guard lock(q_mu_);++role_stats_.refused;return;
+    }
+#endif
+#ifdef TT01_PRODUCER_COLD_QUALIFICATION
+    if(manual&&manual->observed_rf().bound&&manual->observed_rf().count&&
+       (!x||!n||!(rate_hz>0)||mode()==Mode::OFF||array_only_.load(std::memory_order_relaxed))){
+        manual->discard_nonempty();
+        std::lock_guard lock(q_mu_);++role_stats_.refused;return;
+    }
+#endif
     // n = 0 with internal streams: the VFO has no samples this block (the
     // beamformer held them back) - its internal streams still go, so they
     // stay continuous
@@ -2207,7 +2747,8 @@ void DigitalDecoder::push(const std::complex<float>* x, size_t n, float rate_hz,
     }
     // the copies are made outside the queue's lock (the worker takes it per block)
     Block b;
-    b.x.assign(x, x + n);
+    if(n)b.x.assign(x, x + n);
+    b.manual=std::move(manual);
     b.rate = rate_hz;
     b.rf = rf_hz;
     b.pos = pos;
@@ -2246,19 +2787,148 @@ void DigitalDecoder::push(const std::complex<float>* x, size_t n, float rate_hz,
 // its internal streams go and stay together, so the cap bounds both (a 2.4
 // MHz internal stream is 19 MB a second). A decoder that fell behind (CPU
 // starved) loses the oldest blocks
+void DigitalDecoder::enqueue_locked(Block&& b) {
+    queued_s_ += b.dur;
+    queue_.push_back(std::move(b));
+    while (queued_s_ > static_cast<double>(QUEUE_MAX_SECONDS) && queue_.size() > 1) {
+        queued_s_ -= queue_.front().dur;
+        if(queue_.front().managed)++managed_stats_.overflow;
+        if(queue_.front().manual)++role_stats_.overflow;
+        queue_.pop_front();
+        dropped_++;
+    }
+    if (queue_.size() == 1) queued_s_ = queue_.front().dur;   // (no drift)
+}
 void DigitalDecoder::enqueue(Block&& b) {
+#ifdef TT01_ROLE_QUALIFICATION
+    auto pub=role_authority_.load();
+    if(pub||b.manual){
+        if(pub&&b.manual&&
+#ifdef TT01_MANUAL_CONTINUITY_QUALIFICATION
+            managed_iq::manual_output::admit(*b.manual,this,pub,[&]{
+#else
+            b.manual->admit(this,pub,[&]{
+#endif
+            std::lock_guard lock(q_mu_);
+            if(stop_||!b.manual->claim_submission(b.am>0))return false;
+#ifdef TT01_MANUAL_LOSS_QUALIFICATION
+            // This first consumable candidate scope is fixed independent
+            // P25 single-stream only; other inputs cannot mint report authority.
+            if(b.manual->segment()&&b.manual->tuner()>=0&&
+                b.manual->mode()==Mode::PLUGIN&&b.manual->plugin()=="p25"&&
+                !b.am&&!b.m&&b.aux.empty()){
+#ifdef TT01_MANUAL_ORIGIN_QUALIFICATION
+#ifdef TT01_PRODUCER_COLD_QUALIFICATION
+                if(!b.manual->matches_rf(b.rf,b.rate,b.bw,b.x.size())){
+                    pub->manual_origin_failed_locked(b.manual->seq(),b.manual->origin_loss());
+                    return false;
+                }
+#endif
+                auto epoch=pub->manual_origin_submission_locked(b.manual->role(),b.manual->segment(),b.manual->seq(),
+                    b.manual->origin_loss(),!queue_.empty()&&queued_s_+b.dur>double(QUEUE_MAX_SECONDS));
+                if(!epoch)return false;
+#else
+                auto epoch=pub->manual_submission_locked(b.manual->role(),b.manual->segment(),
+                    b.manual->seq(),!queue_.empty()&&queued_s_+b.dur>double(QUEUE_MAX_SECONDS));
+                if(epoch==UINT64_MAX)return false;
+#endif
+#ifdef TT01_PRODUCER_COLD_QUALIFICATION
+                // The overflow/gap-triggering old DSP block may be queued
+                // for eviction accounting, but never adopts the new epoch.
+                b.manual->loss_epoch_.store(b.manual->origin_loss());
+#else
+                b.manual->loss_epoch_.store(epoch);
+#endif
+            }else if(b.manual->segment()){
+                // Refuse unsupported lanes in this qualification variant.
+                // No old control output survives a known unqualified input.
+#ifdef TT01_MANUAL_ORIGIN_QUALIFICATION
+                pub->manual_origin_failed_locked(b.manual->seq(),b.manual->origin_loss());
+#else
+                pub->lose_manual_locked();
+#endif
+                return false;
+            }
+#endif
+            enqueue_locked(std::move(b));++role_stats_.accepted;return true;
+        })){q_cv_.notify_one();return;}
+        std::lock_guard lock(q_mu_);++role_stats_.refused;return;
+    }
+#endif
     {
         std::lock_guard<std::mutex> lk(q_mu_);
-        queued_s_ += b.dur;
-        queue_.push_back(std::move(b));
-        while (queued_s_ > static_cast<double>(QUEUE_MAX_SECONDS) && queue_.size() > 1) {
-            queued_s_ -= queue_.front().dur;
-            queue_.pop_front();
-            dropped_++;
-        }
-        if (queue_.size() == 1) queued_s_ = queue_.front().dur;   // (no drift)
+        enqueue_locked(std::move(b));
     }
     q_cv_.notify_one();
+}
+
+void DigitalDecoder::bind_role(std::shared_ptr<managed_iq::Publication> pub){
+#ifdef TT01_ROLE_QUALIFICATION
+    std::shared_ptr<managed_iq::Publication> empty;
+    if(pub)role_authority_.compare_exchange_strong(empty,std::move(pub));
+#else
+    (void)pub;
+#endif
+}
+DigitalDecoder::RoleQueueStats DigitalDecoder::role_queue_stats(){
+    std::lock_guard lock(q_mu_);return role_stats_;
+}
+#ifndef TT01_OPERATIONAL_BUILD
+bool DigitalDecoder::qualification_stop(){
+#ifdef TT01_MANUAL_CONTINUITY_QUALIFICATION
+    managed_iq::Writer stopping(role_authority_.load());
+#endif
+#ifdef TT01_ROLE_QUALIFICATION
+    {std::lock_guard lock(q_mu_);stop_=true;}
+    q_cv_.notify_all();
+    if(managed_iq::role_test::shutdown_hook)managed_iq::role_test::shutdown_hook(this);
+    if(worker_.joinable())worker_.join();
+    return true;
+#else
+    return false;
+#endif
+}
+#endif // !TT01_OPERATIONAL_BUILD
+DigitalDecoder::ManagedQueueStats DigitalDecoder::managed_queue_stats() {
+    std::lock_guard lock(q_mu_);return managed_stats_;
+}
+
+bool DigitalDecoder::push_managed(std::shared_ptr<const managed_iq::WorkerEnvelope> envelope) {
+#ifdef TT01_WORKER_QUALIFICATION
+#ifdef TT01_ROLE_QUALIFICATION
+    // Bound instances are manager-created threaded decoders. Do not read
+    // std::thread::joinable concurrently with the qualification stop/join.
+    const auto authority=role_authority_.load();
+    if(authority&&envelope&&authority==envelope->authority_&&envelope->claim_submission()){
+#else
+    if(envelope&&worker_.joinable()&&envelope->claim_submission()){
+#endif
+        Block b;
+        b.rate=envelope->rate();b.rf=envelope->provenance().observed_rf();
+        b.pos=envelope->pos();b.ns=envelope->samples().size();
+        b.bw=envelope->provenance().bandwidth;b.dur=double(b.ns)/b.rate;
+        b.managed=envelope;
+        // Exactly one insertion per immutable envelope. Queue-only lock
+        // nested under source/domain/publication; no DSP or callback here.
+        if(b.rate>0&&b.dur<=QUEUE_MAX_SECONDS&&envelope->admit(this,[&]{
+            std::lock_guard lock(q_mu_);
+            if(stop_||mode()!=Mode::PLUGIN)return false;
+#ifdef TT01_MANAGED_LOSS_QUALIFICATION
+            // Exact current placement is retired before known eviction.
+            // Preserve actual bounded queue accounting; the new block and
+            // every retained old-token block must fail future admission.
+            if(!queue_.empty()&&queued_s_+b.dur>double(QUEUE_MAX_SECONDS))
+                envelope->authority_->retire_admitted(envelope->provenance().placement);
+#endif
+            enqueue_locked(std::move(b));++managed_stats_.accepted;return true;
+        })){
+            q_cv_.notify_one();return true;
+        }
+    }
+#else
+    (void)envelope;
+#endif
+    std::lock_guard lock(q_mu_);++managed_stats_.refused;return false;
 }
 
 int DigitalDecoder::wanted_streams(StreamWant* out) const {
@@ -2284,13 +2954,20 @@ void DigitalDecoder::set_array_wanted(bool on, double burst_s, double period_s, 
 }
 
 void DigitalDecoder::push_array(const std::complex<float>* const* ch, int m, size_t n, float rate_hz, double rf_hz,
-                                uint64_t pos) {
+                                uint64_t pos,std::shared_ptr<const managed_iq::ManualEnvelope> manual) {
+#ifdef TT01_ROLE_QUALIFICATION
+    auto authority=role_authority_.load();
+    if((authority||manual)&&(!authority||!manual||!manual->admit(this,authority,[]{return true;}))){
+        std::lock_guard lock(q_mu_);++role_stats_.refused;return;
+    }
+#endif
     if (mode() == Mode::OFF || n == 0 || m < 1 || m > 8 || !wants_array() || !(rate_hz > 0)) return;
     // only the plugin's bursts (stream time): a block whose first sample is in one
     const double burst = arr_burst_.load(std::memory_order_relaxed), period = arr_period_.load(std::memory_order_relaxed);
     if (burst < period && std::fmod(static_cast<double>(pos) / rate_hz, period) >= burst) return;
     Block b;
     b.am = m;
+    b.manual=std::move(manual);
     b.ns = n;
     b.rate = rate_hz;
     b.rf = rf_hz;
@@ -2321,6 +2998,24 @@ void DigitalDecoder::set_trunk_handler(TrunkHandler h) {
 }
 
 void DigitalDecoder::deliver_trunk(const std::string& plugin, trunk::PluginEvent&& ev) {
+#ifdef TT01_MANUAL_OUTPUT_QUALIFICATION
+    namespace mo=managed_iq::manual_output;
+    if(auto pub=role_authority_.load()){
+        const auto ctx=mo::context;
+        if(ctx.closing||!ctx.stamp||ctx.stamp->decoder_identity()!=this||ctx.stamp->authority()!=pub){
+            mo::count_quarantined(ctx.closing);
+            if(mo::hook)mo::hook(ctx.closing?mo::Stage::closing:mo::Stage::unattributed,
+                mo::Report{vfo(),0,plugin,ev,ctx.stamp,ctx.generation});
+            return;
+        }
+        // No authority mutex around a callback. The manager enqueue
+        // revalidates the original scope after any callback barrier.
+        if(mo::hook)mo::hook(mo::Stage::callback,mo::Report{vfo(),0,plugin,ev,ctx.stamp,ctx.generation});
+        if(!mo::admit_report(*ctx.stamp,this,pub,ctx.generation,[]{return true;})){
+            mo::count_callback_refused();return;
+        }
+    }
+#endif
     TrunkHandler h;
     {
         std::lock_guard<std::mutex> lk(talker_mu_);
@@ -2359,6 +3054,9 @@ void DigitalDecoder::deliver_video(const VideoFrameReport& f) {
 
 void DigitalDecoder::process(const std::complex<float>* x, size_t n, float rate_hz, double rf_hz, uint64_t pos,
                              const std::complex<int16_t>* mc, int mc_m, int bw_hz, const AuxStream* aux, size_t naux) {
+#ifdef TT01_ROLE_QUALIFICATION
+    if(role_authority_.load()){std::lock_guard lock(q_mu_);++role_stats_.refused;return;}
+#endif
     if (reset_pending_.exchange(false)) engine_->reset_all();
     engine_->configure(mode(), options(), plugin_id());
     want_mc_.store(engine_->multichannel(), std::memory_order_relaxed);
@@ -2366,16 +3064,93 @@ void DigitalDecoder::process(const std::complex<float>* x, size_t n, float rate_
                      internal_streams_ ? naux : 0);
 }
 
-void DigitalDecoder::drain(int timeout_ms) { engine_->drain(timeout_ms); }
+void DigitalDecoder::drain(int timeout_ms) {
+#ifdef TT01_ROLE_QUALIFICATION
+    if(role_authority_.load()){std::lock_guard lock(q_mu_);++role_stats_.refused;return;}
+#endif
+    engine_->drain(timeout_ms);
+}
 
 void DigitalDecoder::run() {
     bool pending = false;   // samples still queued for a plugin's pipe
+#ifdef TT01_GENERATION_QUALIFICATION
+    // Permanent quarantine of the managed decoder in this offline variant;
+    // B2B will qualify manual-role transitions before activating delivery.
+    bool managed_lane=false;
+    std::shared_ptr<const managed_iq::WorkerEnvelope> managed_ready;
+    uint64_t expected_pos=0;
+    uint32_t sync_id=0;
+    const auto worker_running=[&]{std::lock_guard lock(q_mu_);return !stop_;};
+    auto close_ready=[&]{
+        engine_->close_managed_generation();
+        if(managed_ready)managed_iq::generation_test::trace(this,
+            managed_iq::generation_test::Stage::closed,*managed_ready,sync_id);
+        managed_ready.reset();
+    };
+#ifdef TT01_INTEGRATED_RESIDUAL_QUALIFICATION
+    auto retire_dead_managed=[&]{
+        if(!managed_ready)return;
+        if(!managed_ready->admit(this,[]{return true;})){
+            close_ready();return;
+        }
+        if(!engine_->managed_idle_clean()){
+            // The exact original envelope, never the currently selected
+            // VFO identity. Revalidate under its admission locks.
+            managed_ready->admit(this,[&]{
+                return managed_ready->authority_->retire_admitted(managed_ready->provenance().placement);
+            });
+            close_ready();
+        }
+    };
+#endif
+#endif
+#ifdef TT01_ROLE_QUALIFICATION
+    std::optional<managed_iq::RoleStamp> manual_ready;
+#ifdef TT01_MANUAL_OUTPUT_QUALIFICATION
+    namespace mo=managed_iq::manual_output;
+    std::shared_ptr<const managed_iq::ManualEnvelope> manual_last;
+#ifdef TT01_MANUAL_CONTINUITY_QUALIFICATION
+    std::shared_ptr<mo::Generation> manual_generation;
+#endif
+#endif
+    auto close_manual=[&]{
+        if(manual_ready){
+#ifdef TT01_MANUAL_OUTPUT_QUALIFICATION
+#ifdef TT01_MANUAL_CONTINUITY_QUALIFICATION
+            if(manual_generation)manual_generation->retire();
+            manual_generation.reset();
+#endif
+            mo::Scope closing(manual_last,true);
+            manual_last.reset();
+#endif
+            engine_->close_managed_generation();manual_ready.reset();pending=false;
+            if(managed_iq::role_test::hook)managed_iq::role_test::hook(this,
+                managed_iq::role_test::Stage::idle_closed,nullptr,nullptr,0);
+        }
+    };
+#endif
     for (;;) {
         Block b;
         bool have = false;
         {
             std::unique_lock<std::mutex> lk(q_mu_);
             const auto ready = [this] { return stop_ || !queue_.empty() || reset_pending_.load(); };
+#ifdef TT01_GENERATION_QUALIFICATION
+#ifdef TT01_ROLE_QUALIFICATION
+            if(role_authority_.load()){
+                q_cv_.wait_for(lk,std::chrono::milliseconds(pending?2:10),ready);
+            }else
+#endif
+            if(managed_lane){
+                if(!q_cv_.wait_for(lk,std::chrono::milliseconds(10),ready)){
+                    lk.unlock();
+                    // No plugin flush or report delivery in this lane.
+                    // Revalidate retained authority even without further IQ.
+                    if(managed_ready&&(!managed_ready->admit(this,[]{return true;})||!engine_->managed_runner_alive()))close_ready();
+                    continue;
+                }
+            } else
+#endif
             if (!pending) {
                 q_cv_.wait(lk, ready);
             } else if (!q_cv_.wait_for(lk, std::chrono::milliseconds(2), ready)) {
@@ -2384,7 +3159,18 @@ void DigitalDecoder::run() {
                 pending = engine_->flush_pending();
                 continue;
             }
-            if (stop_) return;
+            if (stop_) {
+#ifdef TT01_ROLE_QUALIFICATION
+                for(auto& q:queue_){
+                    if(q.manual)++role_stats_.shutdown;
+                    if(q.managed)++role_stats_.managed_shutdown;
+                }
+                queue_.clear();queued_s_=0;lk.unlock();
+                close_manual();
+                if(managed_ready)close_ready();
+#endif
+                return;
+            }
             if (!queue_.empty()) {
                 b = std::move(queue_.front());
                 queue_.pop_front();
@@ -2392,6 +3178,334 @@ void DigitalDecoder::run() {
                 have = true;
             }
         }
+#ifdef TT01_INTEGRATED_RESIDUAL_QUALIFICATION
+        // Both an idle bound worker and one about to take fresh work
+        // retire a known dead retained runner before admitting new work.
+        retire_dead_managed();
+#endif
+        if(have&&b.managed){
+#ifdef TT01_WORKER_QUALIFICATION
+            using namespace managed_iq::worker_test;
+            if(hook)hook(this,Event::before_start,*b.managed);
+            const bool admitted=b.managed->admit(this,[&]{
+                std::lock_guard lock(q_mu_);
+                if(stop_||mode()!=Mode::PLUGIN)return false;
+                ++managed_stats_.started;return true;
+            });
+            if(!admitted){std::lock_guard lock(q_mu_);++managed_stats_.stale;}
+            if(hook)hook(this,admitted?Event::started:Event::stale,*b.managed);
+#ifdef TT01_GENERATION_QUALIFICATION
+            namespace gt=managed_iq::generation_test;
+#ifdef TT01_ROLE_QUALIFICATION
+            if(admitted)close_manual();
+#endif
+            managed_lane=true;pending=false;
+            // A reset notification cannot cause an unfenced legacy engine
+            // transition in this qualification variant.
+            reset_pending_.exchange(false);
+            if(!admitted){
+                if(managed_ready&&(!managed_ready->admit(this,[]{return true;})||!engine_->managed_runner_alive()))close_ready();
+                continue;
+            }
+#ifdef TT01_ROLE_QUALIFICATION
+            bool delivered=false;
+            struct CountManaged {
+                std::mutex& mu;RoleQueueStats& stats;bool& delivered;
+                ~CountManaged(){std::lock_guard lock(mu);if(delivered)++stats.managed_completed;else ++stats.managed_failed;}
+            } accounting{q_mu_,role_stats_,delivered};
+#endif
+            const auto& e=*b.managed;
+#ifdef TT01_MANAGED_STAGE_LOSS_QUALIFICATION
+            auto retire=[&]{
+                e.admit(this,[&]{return e.authority_->retire_admitted(e.provenance().placement);});
+            };
+#endif
+            const bool same=managed_ready&&
+                managed_ready->provenance().placement==e.provenance().placement&&
+                managed_ready->source()==e.source()&&managed_ready->wire()==e.wire()&&
+                managed_ready->segment()==e.segment()&&expected_pos==e.pos()&&
+                managed_ready->rate()==e.rate()&&
+                managed_ready->provenance().observed_rf()==e.provenance().observed_rf()&&
+                engine_->managed_runner_alive();
+            if(!same){
+#ifdef TT01_INTEGRATED_RESIDUAL_QUALIFICATION
+                retire_dead_managed();
+                if(!e.admit(this,[]{return true;}))continue;
+#endif
+                if(managed_ready)close_ready();
+                if(sync_id==UINT32_MAX){
+#ifdef TT01_MANAGED_STAGE_LOSS_QUALIFICATION
+                    retire();
+#endif
+                    gt::trace(this,gt::Stage::refused,e,sync_id,"SYNC identity exhausted");continue;
+                }
+                ++sync_id;
+                if(!engine_->prepare_managed_generation(e,sync_id,worker_running
+#ifdef TT01_MANAGED_STAGE_LOSS_QUALIFICATION
+                    ,retire
+#endif
+                ))continue;
+            }
+            // Readiness linearizes independently from prior B1 start and
+            // ACK. No authority lock spans the wire exchange or hooks.
+            if(!e.admit(this,[]{return true;})){
+                close_ready();gt::trace(this,gt::Stage::refused,e,sync_id,"retired before readiness");continue;
+            }
+            managed_ready=b.managed;
+            gt::trace(this,same?gt::Stage::reused:gt::Stage::ready,e,sync_id);
+#ifdef TT01_SAMPLE_QUALIFICATION
+            if(!engine_->deliver_managed_samples(e,sync_id,worker_running
+#ifdef TT01_MANAGED_STAGE_LOSS_QUALIFICATION
+                ,retire
+#endif
+            )){
+                close_ready();continue;
+            }
+#ifdef TT01_ROLE_QUALIFICATION
+            delivered=true;
+#endif
+#endif
+            expected_pos=e.pos()+e.samples().size();
+#endif
+#endif
+            // B1 only: even a valid start is NOT allowed to enter Engine.
+            // B2 must qualify ordered reset/options/SYNC and retire pipe work.
+            continue;
+        }
+#ifdef TT01_ROLE_QUALIFICATION
+        auto bound=role_authority_.load();
+        if(bound){
+            namespace rt=managed_iq::role_test;
+            reset_pending_.exchange(false);
+            if(managed_ready&&!managed_ready->admit(this,[]{return true;}))close_ready();
+            if(manual_ready&&!bound->role_current(*manual_ready))close_manual();
+#ifdef TT01_MANUAL_OUTPUT_QUALIFICATION
+            if(manual_last&&!mo::admit(*manual_last,this,bound,[]{return true;}))close_manual();
+#ifdef TT01_MANUAL_CONTINUITY_QUALIFICATION
+            if(manual_generation&&!manual_generation->admit([]{return true;}))close_manual();
+#ifdef TT01_MANUAL_RUNNER_QUALIFICATION
+            if(manual_last&&manual_generation&&manual_last->mode()==Mode::PLUGIN&&manual_last->plugin()=="p25"
+#ifdef TT01_OPERATIONAL_BUILD
+               &&manual_last->segment()
+#endif
+               ){
+                bool healthy;
+                {mo::Scope operation(manual_last,false,manual_generation);
+                    healthy=engine_->poll_manual_retained();
+                    if(!healthy)retire_manual_context_exact();
+                }
+                if(!healthy||!manual_generation->admit([]{return true;}))close_manual();
+            }
+#endif
+            if(have&&b.manual&&manual_last){
+                // Retire before any next-generation sample is processed.
+                // A stream and array delivery from one packet may share seq.
+                const auto old=manual_last->seq(),next=b.manual->seq();
+                // Qualified nonempty envelopes can skip host packet
+                // sequence only across publisher-accounted empty passes.
+                // The exact segment/loss ledger fences all missing submits.
+                bool gap=next!=old&&(old==UINT64_MAX||next!=old+1);
+#ifdef TT01_PRODUCER_COLD_QUALIFICATION
+                if(b.manual->observed_rf().bound&&manual_last->observed_rf().bound&&
+                   b.manual->loss_epoch()==manual_last->loss_epoch()&&b.manual->loss_current())gap=false;
+#endif
+                if(b.manual->segment()!=manual_last->segment()||next<old||
+#ifdef TT01_OPERATIONAL_BUILD
+                   (b.manual->segment()&&gap)
+#else
+                   gap
+#endif
+                   )close_manual();
+            }
+#endif
+#endif
+            if(have){
+                auto trace=[&](rt::Stage stage){if(rt::hook)rt::hook(this,stage,b.manual.get(),b.x.data(),b.x.size());};
+                trace(rt::Stage::before_start);
+#ifdef TT01_MANUAL_OUTPUT_QUALIFICATION
+#ifdef TT01_PRODUCER_COLD_QUALIFICATION
+                if(b.manual&&b.manual->observed_rf().bound&&
+                    !b.manual->matches_rf(b.rf,b.rate,b.bw,b.x.size())){
+                    {std::lock_guard lock(q_mu_);++role_stats_.stale;}
+                    trace(rt::Stage::stale);continue;
+                }
+#endif
+                if(!b.manual||!mo::admit(*b.manual,this,bound,[&]{
+#ifdef TT01_MANUAL_LOSS_QUALIFICATION
+#ifdef TT01_OPERATIONAL_BUILD
+                    return !b.manual->segment()||b.manual->loss_current();
+#else
+                    return b.manual->loss_current();
+#endif
+#else
+                    return true;
+#endif
+                })){
+#else
+                if(!b.manual||!b.manual->admit(this,bound,[]{return true;})){
+#endif
+                    {std::lock_guard lock(q_mu_);++role_stats_.stale;}
+                    trace(rt::Stage::stale);continue;
+                }
+                if(managed_ready)close_ready();
+                managed_lane=false;
+                if(!manual_ready||*manual_ready!=b.manual->role()){
+                    close_manual();engine_->close_managed_generation();
+                    manual_ready=b.manual->role();
+                }
+                // Configuration belongs to the captured role; the engine
+                // is worker-owned, so in-flight old work cannot use a new
+                // managed runner. Revalidate after a close/start barrier.
+                if(!b.manual->admit(this,bound,[&]{
+                    std::lock_guard lock(q_mu_);if(stop_)return false;
+#ifdef TT01_MANUAL_LOSS_QUALIFICATION
+#ifdef TT01_OPERATIONAL_BUILD
+                    if(b.manual->segment()&&!b.manual->loss_current())return false;
+#else
+                    if(!b.manual->loss_current())return false;
+#endif
+#endif
+                    ++role_stats_.started;return true;
+                })){
+                    {std::lock_guard lock(q_mu_);++role_stats_.stale;}
+                    close_manual();trace(rt::Stage::stale);continue;
+                }
+                trace(rt::Stage::started);
+#ifdef TT01_MANUAL_OUTPUT_QUALIFICATION
+                if(!mo::admit(*b.manual,this,bound,[&]{
+                    std::lock_guard lock(q_mu_);
+#ifdef TT01_MANUAL_LOSS_QUALIFICATION
+#ifdef TT01_OPERATIONAL_BUILD
+                    if(b.manual->segment()&&!b.manual->loss_current())return false;
+#else
+                    if(!b.manual->loss_current())return false;
+#endif
+#endif
+                    return !stop_;
+                })){
+#else
+                if(!b.manual->admit(this,bound,[&]{std::lock_guard lock(q_mu_);return !stop_;})){
+#endif
+                    {std::lock_guard lock(q_mu_);++role_stats_.finished;++role_stats_.retired;}
+                    close_manual();trace(rt::Stage::retired);continue;
+                }
+#ifdef TT01_MANUAL_OUTPUT_QUALIFICATION
+                manual_last=b.manual;
+#ifdef TT01_MANUAL_CONTINUITY_QUALIFICATION
+                // Configure before minting a new output generation. A
+                // startup RESET cannot inherit sample provenance.
+                if(!manual_generation){
+                    engine_->configure(b.manual->mode(),b.manual->options(),b.manual->plugin());
+#ifdef TT01_MANUAL_LOSS_QUALIFICATION
+#ifdef TT01_OPERATIONAL_BUILD
+                    if(!b.manual->segment())manual_generation=std::make_shared<mo::Generation>();
+                    else
+#endif
+                    manual_generation=std::make_shared<mo::Generation>(bound,b.manual->loss_epoch());
+#else
+                    manual_generation=std::make_shared<mo::Generation>();
+#endif
+                }
+                mo::Scope operation(manual_last,false,manual_generation);
+#else
+                mo::Scope operation(manual_last);
+#endif
+#endif
+                engine_->configure(b.manual->mode(),b.manual->options(),b.manual->plugin());
+                want_mc_.store(engine_->multichannel(),std::memory_order_relaxed);
+                if(b.manual->mode()!=Mode::OFF){
+                    if(b.am>0)engine_->process_array(b.x.data(),b.am,b.ns,b.rate,b.rf,b.pos);
+                    else{
+                        AuxStream aux[MAX_STREAMS];size_t naux=0;
+                        for(const auto& a:b.aux){
+                            if(naux>=static_cast<size_t>(MAX_STREAMS))break;
+                            auto& s=aux[naux++];s.width_hz=a.w;s.rate_hz=a.rate;s.x=a.x.data();
+                            s.n=a.x.size();s.pos=a.pos;s.mc=a.m?a.mc.data():nullptr;s.mc_m=a.m;
+                        }
+                        engine_->process(b.x.data(),b.x.size(),b.rate,b.rf,b.pos,
+                            b.m?b.mc.data():nullptr,b.m,b.bw,aux,naux);
+                    }
+                }
+#ifdef TT01_MANUAL_RUNNER_QUALIFICATION
+                if(b.manual->mode()==Mode::PLUGIN&&b.manual->plugin()=="p25"&&
+#ifdef TT01_OPERATIONAL_BUILD
+                   b.manual->segment()&&
+#endif
+                   !engine_->manual_runner_alive())retire_manual_context_exact();
+#endif
+#ifdef TT01_MANUAL_OUTPUT_QUALIFICATION
+                const bool current=mo::admit(*b.manual,this,bound,[&]{
+#ifdef TT01_MANUAL_LOSS_QUALIFICATION
+#ifdef TT01_OPERATIONAL_BUILD
+                    return !b.manual->segment()||b.manual->loss_current();
+#else
+                    return b.manual->loss_current();
+#endif
+#else
+                    return true;
+#endif
+                });
+#else
+                const bool current=b.manual->admit(this,bound,[]{return true;});
+#endif
+                {std::lock_guard lock(q_mu_);++role_stats_.finished;if(!current)++role_stats_.retired;}
+                if(!current){close_manual();trace(rt::Stage::retired);}
+                else trace(rt::Stage::finished);
+                continue;
+            }
+            // Idle configuration enables array/AUTO wants without adopting
+            // sample provenance. Flush only an authorized existing role.
+            auto role=bound->capture_role();
+            if(!role||role->role!=managed_iq::Role::manual)continue;
+            if(managed_ready)close_ready();
+            if(!manual_ready||*manual_ready!=*role){
+                close_manual();
+                auto m=mode();auto o=options();auto plugin=plugin_id();
+                if(!bound->admit_manual(*role,[]{return true;}))continue;
+                engine_->close_managed_generation();manual_ready=*role;
+                engine_->configure(m,o,plugin);
+                want_mc_.store(engine_->multichannel(),std::memory_order_relaxed);
+            }
+#ifdef TT01_MANUAL_OUTPUT_QUALIFICATION
+            // No sample-bearing operation has occurred yet: do not invent
+            // provenance for a startup/idle report.
+            if(manual_last&&mo::admit(*manual_last,this,bound,[]{return true;})){
+#ifdef TT01_MANUAL_CONTINUITY_QUALIFICATION
+                mo::Scope operation(manual_last,false,manual_generation);
+#else
+                mo::Scope operation(manual_last);
+#endif
+#ifdef TT01_MANUAL_RUNNER_QUALIFICATION
+                if(manual_last->mode()==Mode::PLUGIN&&manual_last->plugin()=="p25"
+#ifdef TT01_OPERATIONAL_BUILD
+                   &&manual_last->segment()
+#endif
+                   ){
+                    // Retained fixed lane was already polled above.
+                    pending=false;
+                }else pending=engine_->flush_pending();
+#else
+                pending=engine_->flush_pending();
+#endif
+            }else if(manual_last)close_manual();
+#ifdef TT01_MANUAL_RUNNER_QUALIFICATION
+            if(manual_generation&&!manual_generation->admit([]{return true;}))close_manual();
+#endif
+#else
+            if(bound->admit_manual(*manual_ready,[]{return true;}))pending=engine_->flush_pending();
+            else close_manual();
+#endif
+            if(manual_ready&&!bound->role_current(*manual_ready))close_manual();
+            continue;
+        }
+#endif
+#ifdef TT01_GENERATION_QUALIFICATION
+        if(managed_lane){
+            reset_pending_.exchange(false);
+            if(managed_ready&&(!managed_ready->admit(this,[]{return true;})||!engine_->managed_runner_alive()))close_ready();
+            continue; // ordinary/manual re-admission is deliberately unqualified
+        }
+#endif
         if (reset_pending_.exchange(false)) engine_->reset_all();
         engine_->configure(mode(), options(), plugin_id());
         want_mc_.store(mode() != Mode::OFF && engine_->multichannel(), std::memory_order_relaxed);

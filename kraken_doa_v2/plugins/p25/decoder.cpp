@@ -76,6 +76,9 @@ public:
         facts();
     }
     void option(const std::string& k, const std::string& v) override {
+#ifdef TT01_D1_PCM_WIRE
+        if(k=="__tt01_pcm"){trunk_.typed_pcm=v=="1";return;}
+#endif
         br_.option(k, v);
         if (k == "nac") nac_ = br_.opts.p25_nac;
         else if (k == "wacn") wacn_ = parse_hex(v, 0xFFFFF);

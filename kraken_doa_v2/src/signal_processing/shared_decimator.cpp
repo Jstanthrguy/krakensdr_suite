@@ -706,6 +706,9 @@ struct SharedDecimator::ChannelPass {
     DecimatedData* out = nullptr;
     const complex<float>* in = nullptr;
     size_t n = 0;
+#ifdef TT01_DSP_RECEIPT_QUALIFICATION
+    size_t consumed = 0;
+#endif
     bool mix_front = false;                   // the mixer in front of the first stage
     bool direct = false;                      // the first stage filters straight from the block
     complex<float> step{1.0f, 0.0f};          // the mixer's step per input sample
@@ -728,7 +731,13 @@ void SharedDecimator::ChannelPass::begin(SharedDecimator& d, const complex<float
     bandwidth_hz = bandwidth_hz > 0 ? clamp_bandwidth_hz(bandwidth_hz) : d.getBandwidthHz();
     const int decimation_factor = decimation_for_bandwidth(bandwidth_hz);
 
+#ifdef TT01_DSP_RECEIPT_QUALIFICATION
+    // Zero is an invalid decimation factor: no completed pass receipt.
+    consumed=0;
+    result.decimation_used=0;
+#else
     result.decimation_used = decimation_factor;
+#endif
     result.output_rate_hz = SAMPLE_RATE / decimation_factor;
     result.freq_offset_hz = freq_offset_hz;
 
@@ -790,6 +799,10 @@ void SharedDecimator::ChannelPass::begin(SharedDecimator& d, const complex<float
 void SharedDecimator::ChannelPass::chunk(size_t at) {
     if (!st || at >= n) return;
     const size_t c = std::min(DECIM_CHUNK, n - at);
+#ifdef TT01_DSP_RECEIPT_QUALIFICATION
+    if(at!=consumed)throw std::logic_error("noncontiguous decimation chunk");
+    consumed+=c;
+#endif
     std::vector<complex<float>>& res = out->samples;
     if (st->stages.empty()) {
         const Dst dst{res.data() + at, nullptr};
@@ -824,6 +837,10 @@ void SharedDecimator::ChannelPass::finish() {
     if (!st) return;
     if (direct) st->stages.front().end_input();
     out->num_samples = out->samples.size();
+#ifdef TT01_DSP_RECEIPT_QUALIFICATION
+    if(consumed!=n||!n)throw std::logic_error("incomplete decimation pass");
+    out->decimation_used=st->decimation_factor;
+#endif
     dec->total_samples_processed.fetch_add(n);
     dec->total_blocks_processed.fetch_add(1);
 }
@@ -869,6 +886,10 @@ SharedDecimator::MultiChannelDecimated SharedDecimator::decimateMultiChannel(
 // sharing a chunk is what the restructure of 2026-10-22 (the user's go after
 // an estimate) bought: each VFO's first stage used to read every antenna's
 // block on its own - from L3 at best, the extra VFOs' tasks on other cores
+void SharedDecimator::reset_stream_history() {
+    for (auto& state : channel_states_) state->resetRuntime();
+}
+
 void SharedDecimator::decimateVfos(VfoBlock* vfos, size_t count) {
     // One entry per (VFO, channel): its pass and its output
     struct Entry {
@@ -910,6 +931,9 @@ void SharedDecimator::decimateVfos(VfoBlock* vfos, size_t count) {
             d.last_num_channels_ = r.num_channels;
         }
         r.channels.resize(r.num_channels);  // Pre-allocate exact size for parallel writes
+#ifdef TT01_DSP_RECEIPT_QUALIFICATION
+        for(auto& c:r.channels)c.decimation_used=0;
+#endif
 
         // Find minimum number of samples across channels
         size_t min_samples = SIZE_MAX;

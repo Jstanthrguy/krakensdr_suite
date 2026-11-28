@@ -2,6 +2,21 @@
 #include <iostream>
 #include <iomanip>
 #include <algorithm>
+#ifdef TT01_RAW_LOSS_QUALIFICATION
+#include "networking/iq_wire_ingress.hpp"
+extern RawDataBuffer raw_data_buffer;
+namespace {
+// One actual shared ingress queue. Conditional source retirement avoids
+// an old queued source invalidating a replacement source. Any loss from
+// the current source conservatively fences all of its tuners/wire epochs.
+// Source admission actions never acquire this raw queue mutex.
+void retire_raw_loss(const RawDataBuffer* owner,const RawDataPacket& p){
+    if(owner!=&raw_data_buffer)return;
+    auto expected=p.source_epoch;
+    iq_ingress::source_epoch().resync(expected);
+}
+}
+#endif
 
 using namespace std;
 using namespace chrono;
@@ -22,6 +37,9 @@ RawDataBuffer::~RawDataBuffer() {
 
 void RawDataBuffer::drop_front(atomic<size_t>& drop_counter) {
     // Discard the oldest packet (caller must hold lock)
+#ifdef TT01_RAW_LOSS_QUALIFICATION
+    retire_raw_loss(this,packet_queue.front());
+#endif
     total_memory_bytes.fetch_sub(packet_queue.front().memory_usage());
     packet_queue.pop_front();
     drop_counter.fetch_add(1);
@@ -51,11 +69,21 @@ void RawDataBuffer::enforce_queue_size_limit() {
 }
 
 bool RawDataBuffer::push_packet(RawDataPacket&& packet) {
+#ifdef TT01_INTEGRATED_RESIDUAL_QUALIFICATION
+    // Serialize closure and insertion. A refused current-source packet
+    // must not leave report authority usable, even on an empty queue.
+    lock_guard<mutex> lock(queue_mutex);
+    if(shutdown_flag.load()){
+        retire_raw_loss(this,packet);
+        return false;
+    }
+#else
     if (shutdown_flag.load()) {
         return false;
     }
     
     lock_guard<mutex> lock(queue_mutex);
+#endif
     
     // Cleanup stale packets first
     cleanup_stale_packets();
@@ -100,16 +128,31 @@ bool RawDataBuffer::try_pop_packet(RawDataPacket& packet, milliseconds timeout) 
 
 void RawDataBuffer::clear() {
     lock_guard<mutex> lock(queue_mutex);
+#ifdef TT01_RAW_LOSS_QUALIFICATION
+    for(const auto& p:packet_queue)retire_raw_loss(this,p);
+#endif
     packet_queue.clear();
     total_memory_bytes = 0;
 }
 
 void RawDataBuffer::shutdown() {
+#ifdef TT01_INTEGRATED_RESIDUAL_QUALIFICATION
+    {
+        lock_guard<mutex> lock(queue_mutex);
+        // The one global raw queue is terminally closed, even when empty.
+        // No queue insertion or pop can interleave with this intent.
+        if(!shutdown_flag.load()&&this==&raw_data_buffer)
+            iq_ingress::source_epoch().invalidate();
+        shutdown_flag=true;
+        data_available.notify_all();
+    }
+#else
     shutdown_flag = true;
     {
         lock_guard<mutex> lock(queue_mutex);
         data_available.notify_all();
     }
+#endif
 }
 
 size_t RawDataBuffer::size() const {

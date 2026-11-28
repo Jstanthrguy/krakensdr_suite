@@ -457,7 +457,27 @@ same call). A `hang` call goes back to `active` with new activity.
 - HANG ends after the hang time (`TRUNK_HANG`, default 2 s), unless a grant
   update came within `GRANT_FRESH_MS` 2 s AND there was activity within
   `MAX_SILENT_MS` 10 s: grant updates keep a call through pauses, at most 10
-  s of silence.
+  s of silence. In single-voice Independent P25 following, a fresh eligible
+  equal-priority grant from the same site that fits an existing tuner span
+  may take the VFO after an explicit CALL ENDED and the configured hang.
+  Without that contention, the usual grant-extension policy still applies.
+  ACTIVE calls and the existing priority / hold policy are unchanged.
+- Trailing grant updates suppressed by the existing recently-ended call
+  guard are rejected before channel handover; they cannot end a different
+  call on that channel. The guard duration is unchanged. In single-voice
+  Independent P25, a guarded same-channel/slot update-only revival is tentative:
+  it may probe for late entry, but a fresh explicit equal-ranked in-span grant
+  from the same site may take its unconfirmed SETUP VFO. It cannot take an
+  equal-ranked non-tentative owner on the same channel or use contention-aware
+  hang release. An explicit grant, changed assignment or ACTIVE clears the
+  tentative state. Ordinary setup timeout, priority and hold still apply.
+  An initial-grant receipt belongs to its target/over: a decoder-driven re-key
+  to an unseen target clears that receipt, while relabeling to an existing
+  call uses that call's own receipt. Same-target channel/slot moves retain it.
+  Accepted voice CALL reports are ordered by loop consumption (last report
+  wins), not by millisecond timestamp ties. Placement, revival and the
+  calibration SETUP clock hold clear prior report state; existing decoder
+  RESET/serial/slot checks still govern which reports may be accepted.
 - A not-followed call is over `WAIT_EXPIRE_MS` 3 s after its last grant.
 - **Ends** (`end` in `calls` (recent) / `history`): `released` (`GRANT_END`
   for its channel + slot, or `CALL RELEASED`), `ended` (hang time

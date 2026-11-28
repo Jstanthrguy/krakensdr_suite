@@ -41,6 +41,7 @@
 #include "control_handler.hpp"
 #include "continuous_scanner.hpp"
 #include "decimator_manager.hpp"
+#include "networking/iq_wire_ingress.hpp"
 #include "scanner_manager.hpp"
 #include "digital/dig_plugin.hpp"
 #include "geo_address.hpp"   // geo::json_parse
@@ -1048,6 +1049,7 @@ std::string start_rec(const std::string& name, bool use_vfos, bool loop_on) {
     std::string err;
     if (!src->open(path, &err)) return err;
     src->loop.store(loop_on);
+    managed_iq::DomainWrite domain;
     const bool was = g_active.load();
     if (!was) enter_sandbox();
     for (const auto& d : decimator_manager.getDecimatorInfoList())
@@ -1057,6 +1059,7 @@ std::string start_rec(const std::string& name, bool use_vfos, bool loop_on) {
         g_src.reset();
         g_rec = src;
         g_active_id = name;
+        iq_ingress::source_epoch().invalidate();
         g_active_title = name;
         g_started_ms = now_ms();
     }
@@ -1080,6 +1083,7 @@ std::string start(const std::string& id) {
     std::string err;
     if (!src->open(id, &err)) return err;
     utime((std::string(CACHE_DIR) + "/" + id + ".json").c_str(), nullptr);   // the cache keeps what is played
+    managed_iq::DomainWrite domain;
     const bool was = g_active.load();
     if (!was) enter_sandbox();   // the user's state: written now, then nothing until stop
     // every VFO's decoder off first: their talkers (the user's, or the entry
@@ -1091,6 +1095,7 @@ std::string start(const std::string& id) {
         g_rec.reset();
         g_src = src;
         g_active_id = id;
+        iq_ingress::source_epoch().invalidate();
         g_active_title = src->title;
         g_started_ms = now_ms();
     }
@@ -1110,6 +1115,8 @@ std::string start(const std::string& id) {
 }
 
 void stop() {
+    if (!g_active.load()) return;
+    managed_iq::DomainWrite domain;
     if (!g_active.exchange(false)) return;
     station_info.clearPlaybackOverride();
     {
@@ -1118,6 +1125,7 @@ void stop() {
         g_rec.reset();
         g_active_id.clear();
         g_active_title.clear();
+        iq_ingress::source_epoch().invalidate();
     }
     // the playback's decoders and their talkers go first (a VFO whose saved
     // mode is the same plugin would keep the playback's talkers otherwise)
